@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "192740731119",
+    "project_id": "smart-medicine-dispenser-9fdc5",
+    "storage_bucket": "smart-medicine-dispenser-9fdc5.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:192740731119:android:edff8933e761af1cc9931a",
+        "android_client_info": {
+          "package_name": "com.example.my_dispenser_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDrgAQCj7kRUDdLIfiYEnwYjIOKzJVvh38"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
