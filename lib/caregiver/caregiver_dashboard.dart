@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- ADDED FIRESTORE IMPORT ---
 import '../custom_bottom_nav.dart';
 import '../login.dart';
-import '../modals/user_modal.dart'; // To access registeredUsers for dynamic name display
+// Note: You can now safely remove the user_model.dart import if you are fully on Firebase!
 
 class CaregiverDashboard extends StatefulWidget {
-  final String userEmail; // Required parameter to identify the caregiver
+  final String userEmail;
   const CaregiverDashboard({super.key, required this.userEmail});
 
   @override
@@ -13,38 +14,46 @@ class CaregiverDashboard extends StatefulWidget {
 
 class _CaregiverDashboardState extends State<CaregiverDashboard> {
   String fullName = "Caregiver";
+  int _linkedPatientCount = 0; // --- CHANGED TO A STATE VARIABLE ---
 
   @override
   void initState() {
     super.initState();
-    _fetchCaregiverName();
+    _fetchFirestoreData(); // Trigger the database fetch when screen loads
   }
 
-  // Look up the caregiver's name in the global list
-  void _fetchCaregiverName() {
+  // --- NEW ASYNC FIRESTORE FETCH LOGIC ---
+  Future<void> _fetchFirestoreData() async {
     final String cleanEmail = widget.userEmail.trim().toLowerCase();
 
-    final user = registeredUsers.firstWhere(
-      (u) => u['email']?.trim().toLowerCase() == cleanEmail,
-      orElse: () => {},
-    );
+    try {
+      // 1. Fetch Caregiver Name
+      // Look into the 'users' collection where the email matches the logged-in user
+      QuerySnapshot userSnapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: cleanEmail)
+          .limit(1)
+          .get();
 
-    if (user.isNotEmpty && user.containsKey('name')) {
+      if (userSnapshot.docs.isNotEmpty) {
+        setState(() {
+          fullName = userSnapshot.docs.first.get('name') ?? "Caregiver";
+        });
+      }
+
+      // 2. Fetch Linked Patients Count
+      // Look into the 'connections' collection and count how many times this caregiver's email appears
+      QuerySnapshot connectionSnapshot = await FirebaseFirestore.instance
+          .collection('connections')
+          .where('caregiverEmail', isEqualTo: cleanEmail)
+          .get();
+
       setState(() {
-        fullName = user['name']!;
+        _linkedPatientCount = connectionSnapshot.docs.length;
       });
+    } catch (e) {
+      print("Error fetching Firestore data: $e");
     }
-  }
-
-  // Dynamic count of linked patients for this specific caregiver
-  int get linkedPatientCount {
-    return globalConnections
-        .where(
-          (conn) =>
-              conn['caregiverEmail']?.trim().toLowerCase() ==
-              widget.userEmail.trim().toLowerCase(),
-        )
-        .length;
   }
 
   @override
@@ -62,14 +71,16 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
             );
           },
         ),
-        backgroundColor: const Color(0xFF1A3B70), // Consistent theme
+        backgroundColor: const Color(0xFF1A3B70),
         elevation: 0,
         automaticallyImplyLeading: false,
-        title: Row(
+
+        // --- FIXED APPBAR TITLE LAYOUT ---
+        title: const Row(
           children: [
-            const Icon(Icons.people_alt, color: Colors.white),
-            const SizedBox(width: 10),
-            const Text(
+            Icon(Icons.people_alt, color: Colors.white),
+            SizedBox(width: 10),
+            Text(
               "Smart Med",
               style: TextStyle(
                 color: Colors.white,
@@ -77,29 +88,34 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
                 fontSize: 18,
               ),
             ),
-            const Spacer(),
-            const Icon(Icons.notifications_none, color: Colors.white),
-            const SizedBox(width: 15),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  fullName, // DISPLAY REGISTERED NAME
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const Text(
-                  "Primary Caregiver",
-                  style: TextStyle(color: Colors.white70, fontSize: 10),
-                ),
-              ],
-            ),
           ],
         ),
+
+        // --- MOVED PROFILE TO ACTIONS FOR PROPER ALIGNMENT ---
+        actions: [
+          const Icon(Icons.notifications_none, color: Colors.white),
+          const SizedBox(width: 15),
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                fullName, // Now pulls from Firestore!
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Text(
+                "Primary Caregiver",
+                style: TextStyle(color: Colors.white70, fontSize: 10),
+              ),
+            ],
+          ),
+          const SizedBox(width: 20),
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
@@ -119,7 +135,7 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
             // --- SUMMARY STATS ---
             _buildStatCard(
               "Linked Patients",
-              linkedPatientCount.toString(),
+              _linkedPatientCount.toString(), // Uses the new state variable
               Icons.person_add,
               Colors.teal,
             ),
@@ -181,7 +197,7 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
       bottomNavigationBar: CustomBottomNavBar(
         currentIndex: 0,
         role: "Caregiver",
-        userEmail: widget.userEmail, // Pass session email
+        userEmail: widget.userEmail,
       ),
     );
   }

@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- ADDED FIRESTORE IMPORT ---
 import '../custom_bottom_nav.dart';
 import '../login.dart';
-import '../modals/user_modal.dart'; // To access registeredUsers for dynamic name display
 
 class HealthcareDashboard extends StatefulWidget {
-  final String userEmail; // Add email parameter to find the user
+  final String userEmail; 
   const HealthcareDashboard({super.key, required this.userEmail});
 
   @override
@@ -17,22 +17,28 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
   @override
   void initState() {
     super.initState();
-    _fetchProviderName();
+    _fetchFirestoreData(); // --- TRIGGER ASYNC FETCH ---
   }
 
-  // Look up the provider's name in the global list
-  void _fetchProviderName() {
+  // --- NEW ASYNC FIRESTORE FETCH LOGIC ---
+  Future<void> _fetchFirestoreData() async {
     final String cleanEmail = widget.userEmail.trim().toLowerCase();
-    
-    final user = registeredUsers.firstWhere(
-      (u) => u['email']?.trim().toLowerCase() == cleanEmail,
-      orElse: () => {},
-    );
 
-    if (user.isNotEmpty && user.containsKey('name')) {
-      setState(() {
-        fullName = user['name']!;
-      });
+    try {
+      // Look into the 'users' collection where the email matches the logged-in user
+      QuerySnapshot userSnapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: cleanEmail)
+          .limit(1)
+          .get();
+
+      if (userSnapshot.docs.isNotEmpty) {
+        setState(() {
+          fullName = userSnapshot.docs.first.get('name') ?? "Healthcare Provider";
+        });
+      }
+    } catch (e) {
+      print("Error fetching user data: $e");
     }
   }
 
@@ -54,48 +60,57 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
         backgroundColor: const Color(0xFF1A3B70),
         elevation: 0,
         automaticallyImplyLeading: false,
-        title: Row(
+        
+        // --- FIXED APPBAR TITLE LAYOUT ---
+        title: const Row(
           children: [
-            const Icon(Icons.health_and_safety, color: Colors.white),
-            const SizedBox(width: 10),
-            const Text(
+            Icon(Icons.health_and_safety, color: Colors.white),
+            SizedBox(width: 10),
+            Text(
               "Smart Med",
               style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18),
             ),
-            const Spacer(),
-            const Stack(
-              children: [
-                Icon(Icons.notifications, color: Colors.white, size: 24),
-                Positioned(
-                  right: 0,
-                  top: 0,
-                  child: CircleAvatar(radius: 5, backgroundColor: Colors.red),
-                )
-              ],
-            ),
-            const SizedBox(width: 15),
-            const CircleAvatar(
-              radius: 16,
-              backgroundImage: NetworkImage('https://via.placeholder.com/150'),
-            ),
-            const SizedBox(width: 8),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  fullName, // DISPLAY DYNAMIC REGISTERED NAME
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const Icon(Icons.keyboard_arrow_down, color: Colors.white, size: 14),
-              ],
-            ),
           ],
         ),
+
+        // --- MOVED PROFILE TO ACTIONS FOR PROPER RIGHT-ALIGNMENT ---
+        actions: [
+          const Stack(
+            alignment: Alignment.center,
+            children: [
+              Icon(Icons.notifications, color: Colors.white, size: 24),
+              Positioned(
+                right: 0,
+                top: 12, // Adjusted slightly for visual balance
+                child: CircleAvatar(radius: 5, backgroundColor: Colors.red),
+              )
+            ],
+          ),
+          const SizedBox(width: 15),
+          const CircleAvatar(
+            radius: 16,
+            backgroundColor: Color(0xFFE3F2FD), // Replaced broken NetworkImage with a solid color placeholder
+            child: Icon(Icons.person, color: Color(0xFF1A3B70), size: 20),
+          ),
+          const SizedBox(width: 8),
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center, // Centers the text vertically
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                fullName, // --- PULLS DYNAMICALLY FROM FIRESTORE ---
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12, // Increased slightly from 10 for better readability
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Icon(Icons.keyboard_arrow_down, color: Colors.white, size: 14),
+            ],
+          ),
+          const SizedBox(width: 20), // Adds a bit of padding to the far right edge
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
@@ -173,7 +188,7 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
       bottomNavigationBar: CustomBottomNavBar(
         currentIndex: 0,
         role: "Healthcare\nProvider",
-        userEmail: widget.userEmail, // Pass current user email
+        userEmail: widget.userEmail, 
       ),
     );
   }

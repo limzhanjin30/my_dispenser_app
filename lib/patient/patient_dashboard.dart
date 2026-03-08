@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- ADDED FIRESTORE IMPORT ---
 import '../custom_bottom_nav.dart';
 import '../login.dart';
-import '../modals/user_modal.dart';
+// Note: Removed user_model.dart import since we are fetching from Firebase now
 
 class PatientDashboard extends StatefulWidget {
   // Pass the email from LoginPage to identify the user
@@ -19,23 +20,28 @@ class _PatientDashboardState extends State<PatientDashboard> {
   @override
   void initState() {
     super.initState();
-    _fetchUserData();
+    _fetchFirestoreData(); // --- TRIGGER ASYNC FETCH ---
   }
 
-  // Locates the registered name in the global list based on email
-  void _fetchUserData() {
+  // --- NEW ASYNC FIRESTORE FETCH LOGIC ---
+  Future<void> _fetchFirestoreData() async {
+    final String cleanEmail = widget.userEmail.trim().toLowerCase();
+
     try {
-      final user = registeredUsers.firstWhere(
-        (u) => u['email'] == widget.userEmail,
-        orElse: () => {},
-      );
-      if (user.isNotEmpty && user.containsKey('name')) {
+      // Look into the 'users' collection where the email matches the logged-in user
+      QuerySnapshot userSnapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: cleanEmail)
+          .limit(1)
+          .get();
+
+      if (userSnapshot.docs.isNotEmpty) {
         setState(() {
-          fullName = user['name']!;
+          fullName = userSnapshot.docs.first.get('name') ?? "Patient";
         });
       }
     } catch (e) {
-      fullName = "User"; // Fallback name
+      print("Error fetching Firestore data: $e");
     }
   }
 
@@ -84,7 +90,7 @@ class _PatientDashboardState extends State<PatientDashboard> {
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Personalized greeting using registered name
+                    // Personalized greeting using registered name (Now from Firestore!)
                     Text(
                       "Hi, $fullName",
                       style: const TextStyle(

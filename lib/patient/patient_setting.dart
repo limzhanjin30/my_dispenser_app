@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- ADDED FIRESTORE IMPORT ---
 import '../custom_bottom_nav.dart';
 import '../login.dart';
-import '../modals/user_modal.dart';
+// Note: Removed user_model.dart import since we are fetching from Firebase now
 import 'patient_dashboard.dart';
 import 'patient_request.dart';
 import 'patient_linked.dart';
@@ -26,23 +27,28 @@ class _PatientSettingState extends State<PatientSetting> {
   @override
   void initState() {
     super.initState();
-    _fetchUserData();
+    _fetchFirestoreData(); // --- TRIGGER ASYNC FETCH ---
   }
 
-  void _fetchUserData() {
+  // --- NEW ASYNC FIRESTORE FETCH LOGIC ---
+  Future<void> _fetchFirestoreData() async {
+    final String cleanEmail = widget.userEmail.trim().toLowerCase();
+
     try {
-      // This works perfectly because registeredUsers now lives in user_model.dart!
-      final user = registeredUsers.firstWhere(
-        (u) => u['email'] == widget.userEmail,
-        orElse: () => {},
-      );
-      if (user.isNotEmpty && user.containsKey('name')) {
+      // Look into the 'users' collection where the email matches the logged-in user
+      QuerySnapshot userSnapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: cleanEmail)
+          .limit(1)
+          .get();
+
+      if (userSnapshot.docs.isNotEmpty) {
         setState(() {
-          fullName = user['name']!;
+          fullName = userSnapshot.docs.first.get('name') ?? "Patient";
         });
       }
     } catch (e) {
-      fullName = "User";
+      print("Error fetching user data: $e");
     }
   }
 
@@ -51,11 +57,9 @@ class _PatientSettingState extends State<PatientSetting> {
     return Scaffold(
       backgroundColor: const Color(0xFFF5F9FF),
       appBar: AppBar(
-        // --- UPDATED BACK BUTTON LOGIC ---
         leading: IconButton(
           icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
           onPressed: () {
-            // Navigates back to Dashboard and passes the email to keep the name updated
             Navigator.pushReplacement(
               context,
               MaterialPageRoute(
@@ -72,8 +76,7 @@ class _PatientSettingState extends State<PatientSetting> {
         backgroundColor: Colors.white,
         elevation: 0.5,
         centerTitle: true,
-        automaticallyImplyLeading:
-            false, // Prevents the default system back button
+        automaticallyImplyLeading: false,
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(15),
@@ -86,11 +89,11 @@ class _PatientSettingState extends State<PatientSetting> {
                   const CircleAvatar(
                     radius: 35,
                     backgroundColor: Color(0xFFE0E0E0),
-                    child: Icon(Icons.person, size: 50, color: Colors.teal),
+                    child: Icon(Icons.person, size: 50, color: Colors.blue),
                   ),
                   const SizedBox(height: 10),
                   Text(
-                    fullName,
+                    fullName, // --- NOW PULLS DYNAMICALLY FROM FIRESTORE ---
                     style: const TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.bold,
@@ -290,7 +293,6 @@ class _PatientSettingState extends State<PatientSetting> {
     );
   }
 
-  // --- UPDATED HELPER TO ACCEPT ONTAP ---
   Widget _buildListTile(
     String title, {
     String? trailingText,
@@ -322,7 +324,7 @@ class _PatientSettingState extends State<PatientSetting> {
           const Icon(Icons.chevron_right, color: Colors.grey, size: 20),
         ],
       ),
-      onTap: onTap, // NOW IT USES THE PASSED FUNCTION
+      onTap: onTap,
     );
   }
 
