@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
-// REPLACE the 'main.dart' import with your new model:
-import '../modals/user_modal.dart'; // <--- CHANGED THIS LINE
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
 
 class PatientLinked extends StatefulWidget {
   final String userEmail;
@@ -11,117 +10,121 @@ class PatientLinked extends StatefulWidget {
 }
 
 class _PatientLinkedState extends State<PatientLinked> {
-  // Logic to find real connected caregivers and providers
-  List<Map<String, String>> get connectedProfiles {
-    // 1. Find all connection emails where THIS user is the patient
-    // (This now successfully pulls from user_model.dart!)
-    final myConnectionEmails = globalConnections
-        .where(
-          (conn) =>
-              conn['patientEmail']?.trim().toLowerCase() ==
-              widget.userEmail.trim().toLowerCase(),
-        )
-        .map((conn) => conn['caregiverEmail']?.trim().toLowerCase())
-        .toList();
-
-    // 2. Map those emails to their full user profiles from registeredUsers
-    // (This also successfully pulls from user_model.dart!)
-    return registeredUsers
-        .where(
-          (user) =>
-              myConnectionEmails.contains(user['email']?.trim().toLowerCase()),
-        )
-        .map(
-          (user) => {
-            "name": user['name'] ?? "Unknown User",
-            "role": user['role'] ?? "Caregiver",
-            "email": user['email'] ?? "",
-          },
-        )
-        .toList();
-  }
-
-  void _unlinkProfile(String email, String name) {
-    setState(() {
-      // Removes the specific connection from the global list using normalization
-      globalConnections.removeWhere(
-        (conn) =>
-            conn['patientEmail']?.trim().toLowerCase() ==
-                widget.userEmail.trim().toLowerCase() &&
-            conn['caregiverEmail']?.trim().toLowerCase() ==
-                email.trim().toLowerCase(),
-      );
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text("Unlinked from $name"),
-        backgroundColor: Colors.redAccent,
-      ),
-    );
+  
+  // --- NEW: LOGIC TO DELETE CONNECTION FROM FIREBASE ---
+  Future<void> _unlinkProfile(String docId, String name) async {
+    try {
+      await FirebaseFirestore.instance.collection('connections').doc(docId).delete();
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Unlinked from $name"), backgroundColor: Colors.redAccent),
+        );
+      }
+    } catch (e) {
+      debugPrint("Error unlinking: $e");
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    // Refresh the list every time the screen builds
-    final profiles = connectedProfiles;
+    // --- NEW: REAL-TIME STREAM OF CONNECTIONS ---
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection('connections')
+          .where('patientEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
 
-    return Scaffold(
-      backgroundColor: const Color(0xFFF5F9FF),
-      appBar: AppBar(
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: const Text(
-          "Linked Caregivers/Providers",
-          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
-        ),
-        backgroundColor: Colors.white,
-        elevation: 0.5,
-        centerTitle: true,
-      ),
-      body: profiles.isEmpty
-          ? _buildEmptyState()
-          : SingleChildScrollView(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    "Active Connections",
-                    style: TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF1A3B70),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    "These individuals can monitor your Smart Medicine Dispenser logs and receive medication alerts.",
-                    style: TextStyle(color: Colors.black54, fontSize: 14),
-                  ),
-                  const SizedBox(height: 25),
+        if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+          return Scaffold(
+            backgroundColor: const Color(0xFFF5F9FF),
+            appBar: _buildAppBar(),
+            body: _buildEmptyState(),
+          );
+        }
 
-                  ListView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: profiles.length,
-                    itemBuilder: (context, index) {
-                      final profile = profiles[index];
-                      return _buildRequestCard(profile);
-                    },
-                  ),
-                ],
-              ),
+        final connectionDocs = snapshot.data!.docs;
+
+        return Scaffold(
+          backgroundColor: const Color(0xFFF5F9FF),
+          appBar: _buildAppBar(),
+          body: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  "Active Connections",
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  "These individuals can monitor your Smart Medicine Dispenser logs and receive medication alerts.",
+                  style: TextStyle(color: Colors.black54, fontSize: 14),
+                ),
+                const SizedBox(height: 25),
+
+                // We map each connection to a FutureBuilder to fetch the Caregiver's Name/Role from the 'users' collection
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: connectionDocs.length,
+                  itemBuilder: (context, index) {
+                    var connData = connectionDocs[index].data() as Map<String, dynamic>;
+                    String caregiverEmail = connData['caregiverEmail'];
+                    String docId = connectionDocs[index].id;
+
+                    return FutureBuilder<QuerySnapshot>(
+                      future: FirebaseFirestore.instance
+                          .collection('users')
+                          .where('email', isEqualTo: caregiverEmail)
+                          .limit(1)
+                          .get(),
+                      builder: (context, userSnapshot) {
+                        if (!userSnapshot.hasData || userSnapshot.data!.docs.isEmpty) {
+                          return const SizedBox.shrink();
+                        }
+
+                        var userData = userSnapshot.data!.docs.first.data() as Map<String, dynamic>;
+                        return _buildRequestCard(
+                          docId, 
+                          userData['name'] ?? "Unknown User", 
+                          userData['role'] ?? "Caregiver", 
+                          caregiverEmail
+                        );
+                      },
+                    );
+                  },
+                ),
+              ],
             ),
+          ),
+        );
+      },
     );
   }
 
-  Widget _buildRequestCard(Map<String, String> profile) {
-    // Determine icon based on role for better UX
-    IconData roleIcon = profile['role'] == "Healthcare\nProvider"
-        ? Icons.medical_services_outlined
+  PreferredSizeWidget _buildAppBar() {
+    return AppBar(
+      leading: IconButton(
+        icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
+        onPressed: () => Navigator.pop(context),
+      ),
+      title: const Text("Linked Caregivers/Providers", 
+        style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+      backgroundColor: Colors.white,
+      elevation: 0.5,
+      centerTitle: true,
+    );
+  }
+
+  Widget _buildRequestCard(String docId, String name, String role, String email) {
+    IconData roleIcon = role.contains("Healthcare") 
+        ? Icons.medical_services_outlined 
         : Icons.person_outline;
 
     return Container(
@@ -130,9 +133,7 @@ class _PatientLinkedState extends State<PatientLinked> {
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(15),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10),
-        ],
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -148,21 +149,9 @@ class _PatientLinkedState extends State<PatientLinked> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      profile['name']!,
-                      style: const TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    Text(
-                      profile['role']!.replaceAll('\n', ' '),
-                      style: const TextStyle(
-                        color: Colors.blue,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
+                    Text(name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+                    Text(role.replaceAll('\n', ' '), 
+                      style: const TextStyle(color: Colors.blue, fontSize: 12, fontWeight: FontWeight.w600)),
                   ],
                 ),
               ),
@@ -171,26 +160,20 @@ class _PatientLinkedState extends State<PatientLinked> {
           const SizedBox(height: 15),
           const Divider(),
           const SizedBox(height: 10),
-          Text(
-            "Email: ${profile['email']}",
-            style: const TextStyle(color: Colors.black54, fontSize: 13),
-          ),
+          Text("Email: $email", style: const TextStyle(color: Colors.black54, fontSize: 13)),
           const SizedBox(height: 20),
           Row(
             children: [
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: () =>
-                      _unlinkProfile(profile['email']!, profile['name']!),
+                  onPressed: () => _unlinkProfile(docId, name),
                   icon: const Icon(Icons.link_off, size: 18),
                   label: const Text("Unlink Profile"),
                   style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.redAccent,
                     side: const BorderSide(color: Colors.redAccent),
                     padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                   ),
                 ),
               ),
@@ -208,19 +191,9 @@ class _PatientLinkedState extends State<PatientLinked> {
         children: [
           Icon(Icons.people_outline, size: 80, color: Colors.grey[300]),
           const SizedBox(height: 15),
-          const Text(
-            "No active connections.",
-            style: TextStyle(
-              color: Colors.grey,
-              fontSize: 16,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
+          const Text("No active connections.", style: TextStyle(color: Colors.grey, fontSize: 16, fontWeight: FontWeight.w500)),
           const SizedBox(height: 5),
-          const Text(
-            "Your linked caregivers will appear here.",
-            style: TextStyle(color: Colors.grey, fontSize: 13),
-          ),
+          const Text("Your linked caregivers will appear here.", style: TextStyle(color: Colors.grey, fontSize: 13)),
         ],
       ),
     );

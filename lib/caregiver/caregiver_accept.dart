@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../modals/user_modal.dart'; // To access registeredUsers, globalPendingRequests, and globalConnections
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
 
 class CaregiverAccept extends StatefulWidget {
   final String userEmail;
@@ -11,100 +11,108 @@ class CaregiverAccept extends StatefulWidget {
 
 class _CaregiverAcceptState extends State<CaregiverAccept> {
   
-  // --- UPDATED: NORMALIZED FILTERING ---
-  // Filters the global list for requests specifically for THIS caregiver
-  // Inside _CaregiverAcceptState
-  List<Map<String, String>> get myRequests {
-    // 1. Normalize the email of the caregiver currently logged in
-    String cleanMyEmail = widget.userEmail.trim().toLowerCase();
-    
-    // 2. Filter the global list using normalized comparisons
-    return globalPendingRequests.where((req) {
-      String receiver = req['receiverEmail']?.trim().toLowerCase() ?? "";
-      
-      return receiver == cleanMyEmail;
-    }).toList();
-  }
-
-  void _handleAction(int index, bool isAccepted) {
-    var request = myRequests[index];
-    String senderName = request['senderName']!;
-    String senderEmail = request['senderEmail']!;
-
-    if (isAccepted) {
-      setState(() {
-        // Create permanent link in globalConnections
-        globalConnections.add({
+  // --- NEW: LOGIC TO HANDLE FIREBASE ACTIONS ---
+  Future<void> _handleAction(String requestId, Map<String, dynamic> requestData, bool isAccepted) async {
+    try {
+      if (isAccepted) {
+        // 1. Create a permanent connection in the 'connections' collection
+        await FirebaseFirestore.instance.collection('connections').add({
           "caregiverEmail": widget.userEmail.trim().toLowerCase(),
-          "patientEmail": senderEmail.trim().toLowerCase(),
+          "patientEmail": requestData['senderEmail']!.trim().toLowerCase(),
+          "connectedAt": FieldValue.serverTimestamp(),
         });
-      });
+      }
+
+      // 2. Delete the request from the 'requests' collection
+      await FirebaseFirestore.instance.collection('requests').doc(requestId).delete();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(isAccepted ? "Patient linked successfully!" : "Request declined"),
+            backgroundColor: isAccepted ? Colors.teal : Colors.redAccent,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint("Error handling caregiver accept: $e");
     }
-
-    // Remove the request from globalPendingRequests using normalized check
-    setState(() {
-      globalPendingRequests.removeWhere((req) =>
-          req['senderEmail']?.trim().toLowerCase() == senderEmail.trim().toLowerCase() &&
-          req['receiverEmail']?.trim().toLowerCase() == widget.userEmail.trim().toLowerCase());
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(isAccepted ? "Accepted request from $senderName" : "Declined $senderName"),
-        backgroundColor: isAccepted ? Colors.teal : Colors.redAccent,
-        duration: const Duration(seconds: 2),
-      ),
-    );
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFFF5F9FF),
-      appBar: AppBar(
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: const Text("Caregiver Access Requests",
-            style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 18)),
-        backgroundColor: Colors.white,
-        elevation: 0.5,
-        centerTitle: true,
-      ),
-      body: myRequests.isEmpty
-          ? _buildEmptyState()
-          : SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(20, 30, 20, 20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    "Connection Requests",
-                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    "Patients listed below want you to manage their medication dispenser.",
-                    style: TextStyle(color: Colors.black54, fontSize: 14),
-                  ),
-                  const SizedBox(height: 25),
-                  ListView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: myRequests.length,
-                    itemBuilder: (context, index) {
-                      final request = myRequests[index];
-                      return _buildRequestCard(index, request);
-                    },
-                  ),
-                ],
-              ),
+    // --- NEW: REAL-TIME STREAM OF INCOMING REQUESTS ---
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection('requests')
+          .where('receiverEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+
+        if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+          return Scaffold(
+            backgroundColor: const Color(0xFFF5F9FF),
+            appBar: _buildAppBar(),
+            body: _buildEmptyState(),
+          );
+        }
+
+        final requests = snapshot.data!.docs;
+
+        return Scaffold(
+          backgroundColor: const Color(0xFFF5F9FF),
+          appBar: _buildAppBar(),
+          body: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(20, 30, 20, 20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  "Connection Requests",
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  "Patients listed below want you to manage their medication dispenser.",
+                  style: TextStyle(color: Colors.black54, fontSize: 14),
+                ),
+                const SizedBox(height: 25),
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: requests.length,
+                  itemBuilder: (context, index) {
+                    var requestDoc = requests[index];
+                    var data = requestDoc.data() as Map<String, dynamic>;
+                    return _buildRequestCard(requestDoc.id, data);
+                  },
+                ),
+              ],
             ),
+          ),
+        );
+      },
     );
   }
 
-  Widget _buildRequestCard(int index, Map<String, String> request) {
+  PreferredSizeWidget _buildAppBar() {
+    return AppBar(
+      leading: IconButton(
+        icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
+        onPressed: () => Navigator.pop(context),
+      ),
+      title: const Text("Caregiver Access Requests",
+          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 18)),
+      backgroundColor: Colors.white,
+      elevation: 0.5,
+      centerTitle: true,
+    );
+  }
+
+  Widget _buildRequestCard(String docId, Map<String, dynamic> request) {
     return Container(
       margin: const EdgeInsets.only(bottom: 15),
       padding: const EdgeInsets.all(18),
@@ -155,7 +163,7 @@ class _CaregiverAcceptState extends State<CaregiverAccept> {
             children: [
               Expanded(
                 child: ElevatedButton(
-                  onPressed: () => _handleAction(index, true),
+                  onPressed: () => _handleAction(docId, request, true),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.teal,
                     padding: const EdgeInsets.symmetric(vertical: 12),
@@ -167,7 +175,7 @@ class _CaregiverAcceptState extends State<CaregiverAccept> {
               const SizedBox(width: 12),
               Expanded(
                 child: OutlinedButton(
-                  onPressed: () => _handleAction(index, false),
+                  onPressed: () => _handleAction(docId, request, false),
                   style: OutlinedButton.styleFrom(
                     side: const BorderSide(color: Colors.blueGrey),
                     padding: const EdgeInsets.symmetric(vertical: 12),

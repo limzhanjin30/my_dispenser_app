@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../modals/user_modal.dart'; // To access registeredUsers, globalPendingRequests, and globalConnections
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
 
 class CaregiverRequest extends StatefulWidget {
   final String userEmail; // Current Caregiver's email
@@ -11,9 +11,8 @@ class CaregiverRequest extends StatefulWidget {
 
 class _CaregiverRequestState extends State<CaregiverRequest> {
   final TextEditingController _patientEmailController = TextEditingController();
-  
-  // Initialize with a loading state
   String fullName = ""; 
+  bool isLoading = false; // Added to show loading state during DB calls
 
   @override
   void initState() {
@@ -21,24 +20,26 @@ class _CaregiverRequestState extends State<CaregiverRequest> {
     _fetchCaregiverName();
   }
 
-  // Fetches the sender's full name from the global user list
-  void _fetchCaregiverName() {
+  // Fetches current Caregiver's name from Firestore
+  Future<void> _fetchCaregiverName() async {
     try {
-      final user = registeredUsers.firstWhere(
-        (u) => u['email'] == widget.userEmail,
-        orElse: () => {},
-      );
-      if (user.isNotEmpty && user.containsKey('name')) {
+      var userDoc = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .limit(1)
+          .get();
+
+      if (userDoc.docs.isNotEmpty) {
         setState(() {
-          fullName = user['name']!;
+          fullName = userDoc.docs.first.get('name') ?? "Caregiver";
         });
       }
     } catch (e) {
-      fullName = "User"; // Fallback name
+      debugPrint("Error fetching name: $e");
     }
   }
 
-  void _findAndRequest() {
+  Future<void> _findAndRequest() async {
     String targetEmail = _patientEmailController.text.trim().toLowerCase();
     String myEmail = widget.userEmail.trim().toLowerCase();
 
@@ -52,73 +53,88 @@ class _CaregiverRequestState extends State<CaregiverRequest> {
       return;
     }
 
-    // --- STEP 1: Check if already linked ---
-    bool alreadyLinked = globalConnections.any((conn) =>
-        conn['caregiverEmail']?.trim().toLowerCase() == myEmail && 
-        conn['patientEmail']?.trim().toLowerCase() == targetEmail);
-    
-    if (alreadyLinked) {
-      _showSnackBar("You are already linked to this patient.", Colors.blue);
-      return;
-    }
+    setState(() => isLoading = true);
 
-    // --- STEP 2: NEW AUTO-ACCEPT LOGIC ---
-    // Check if there is an INCOMING request from this patient to ME
-    var incomingReq = globalPendingRequests.firstWhere(
-      (req) => req['senderEmail']?.trim().toLowerCase() == targetEmail && 
-               req['receiverEmail']?.trim().toLowerCase() == myEmail,
-      orElse: () => {},
-    );
+    try {
+      // 1. Check if already linked in 'connections' collection
+      var existingConn = await FirebaseFirestore.instance
+          .collection('connections')
+          .where('caregiverEmail', isEqualTo: myEmail)
+          .where('patientEmail', isEqualTo: targetEmail)
+          .get();
 
-    if (incomingReq.isNotEmpty) {
-      setState(() {
-        // 1. Remove the patient's request from the pending list
-        globalPendingRequests.removeWhere((req) =>
-            req['senderEmail']?.trim().toLowerCase() == targetEmail &&
-            req['receiverEmail']?.trim().toLowerCase() == myEmail);
+      if (existingConn.docs.isNotEmpty) {
+        _showSnackBar("You are already linked to this patient.", Colors.blue);
+        setState(() => isLoading = false);
+        return;
+      }
 
-        // 2. Add to permanent connections
-        globalConnections.add({
+      // 2. AUTO-ACCEPT LOGIC: Check if patient already sent a request to ME
+      var incomingReq = await FirebaseFirestore.instance
+          .collection('requests')
+          .where('senderEmail', isEqualTo: targetEmail)
+          .where('receiverEmail', isEqualTo: myEmail)
+          .get();
+
+      if (incomingReq.docs.isNotEmpty) {
+        // Establishes connection immediately if a mutual request exists
+        await FirebaseFirestore.instance.collection('connections').add({
           "caregiverEmail": myEmail,
           "patientEmail": targetEmail,
+          "connectedAt": FieldValue.serverTimestamp(),
         });
-      });
 
-      _showSnackBar("A request from this patient was already waiting. Connection established!", Colors.teal);
-      Future.delayed(const Duration(seconds: 1), () => Navigator.pop(context));
-      return; // Exit early, no need to send a new request
-    }
+        // Delete the redundant request
+        await FirebaseFirestore.instance
+            .collection('requests')
+            .doc(incomingReq.docs.first.id)
+            .delete();
 
-    // --- STEP 3: Standard Request Logic (Check if I already sent one) ---
-    bool alreadyPending = globalPendingRequests.any((req) =>
-        req['senderEmail']?.trim().toLowerCase() == myEmail && 
-        req['receiverEmail']?.trim().toLowerCase() == targetEmail);
-    
-    if (alreadyPending) {
-      _showSnackBar("A request has already been sent to this email.", Colors.orange);
-      return;
-    }
+        _showSnackBar("Mutual request found! Patient linked instantly.", Colors.teal);
+        Navigator.pop(context);
+        return;
+      }
 
-    // --- STEP 4: Verify Patient exists and send new request ---
-    var patient = registeredUsers.firstWhere(
-      (u) => u['email']?.trim().toLowerCase() == targetEmail && u['role'] == 'Patient',
-      orElse: () => {},
-    );
+      // 3. Verify Patient exists and is a "Patient" role
+      var patientQuery = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: targetEmail)
+          .where('role', isEqualTo: 'Patient')
+          .limit(1)
+          .get();
 
-    if (patient.isNotEmpty) {
-      setState(() {
-        globalPendingRequests.add({
-          "senderEmail": myEmail,
-          "senderName": fullName, 
-          "receiverEmail": targetEmail,
-          "senderRole": "Caregiver", // Or "Healthcare\nProvider" for that file
-          "requestText": "$fullName ($myEmail) is requesting access to your dispenser logs.",
-        });
-      });
-      _showSnackBar("Request sent to $targetEmail. Awaiting approval.", Colors.green);
-      Future.delayed(const Duration(seconds: 1), () => Navigator.pop(context));
-    } else {
-      _showSnackBar("Patient record not found.", Colors.red);
+      if (patientQuery.docs.isEmpty) {
+        _showSnackBar("Patient record not found. Please verify the email.", Colors.red);
+      } else {
+        // Check if a request was already sent by this caregiver
+        var pending = await FirebaseFirestore.instance
+            .collection('requests')
+            .where('senderEmail', isEqualTo: myEmail)
+            .where('receiverEmail', isEqualTo: targetEmail)
+            .get();
+
+        if (pending.docs.isNotEmpty) {
+          _showSnackBar("A request has already been sent to this patient.", Colors.orange);
+        } else {
+          // Create the request document in Firestore
+          await FirebaseFirestore.instance.collection('requests').add({
+            "senderEmail": myEmail,
+            "senderName": fullName, 
+            "receiverEmail": targetEmail,
+            "senderRole": "Caregiver", 
+            "requestText": "$fullName ($myEmail) is requesting access to manage your dispenser.",
+            "status": "pending",
+            "createdAt": FieldValue.serverTimestamp(),
+          });
+
+          _showSnackBar("Request sent to $targetEmail. Awaiting approval.", Colors.green);
+          Navigator.pop(context);
+        }
+      }
+    } catch (e) {
+      _showSnackBar("Database error: ${e.toString()}", Colors.red);
+    } finally {
+      if (mounted) setState(() => isLoading = false);
     }
   }
 
@@ -152,12 +168,11 @@ class _CaregiverRequestState extends State<CaregiverRequest> {
               style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
             const SizedBox(height: 10),
             const Text(
-              "Enter the patient's registered email to link their medication dispenser to your clinical dashboard.",
+              "Enter the patient's registered email to link their medication dispenser to your caregiver dashboard.",
               style: TextStyle(color: Colors.black54, fontSize: 14),
             ),
             const SizedBox(height: 30),
 
-            // --- SEARCH CARD ---
             Container(
               padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
@@ -166,23 +181,13 @@ class _CaregiverRequestState extends State<CaregiverRequest> {
                 boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
               ),
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Row(
-                    children: [
-                      Icon(Icons.person_search_outlined, color: Color(0xFF1A3B70)),
-                      SizedBox(width: 10),
-                      Text("Search Patient", 
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                  const SizedBox(height: 20),
                   TextField(
                     controller: _patientEmailController,
                     keyboardType: TextInputType.emailAddress,
                     decoration: InputDecoration(
-                      hintText: "Enter Patient's Email",
-                      prefixIcon: const Icon(Icons.alternate_email),
+                      hintText: "example@patient.com",
+                      prefixIcon: const Icon(Icons.alternate_email, color: Color(0xFF1A3B70)),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                     ),
                   ),
@@ -192,13 +197,15 @@ class _CaregiverRequestState extends State<CaregiverRequest> {
                     width: double.infinity,
                     height: 55,
                     child: ElevatedButton(
-                      onPressed: _findAndRequest,
+                      onPressed: isLoading ? null : _findAndRequest,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFF1A3B70),
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                       ),
-                      child: const Text("Send Access Request", 
-                        style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                      child: isLoading 
+                        ? const CircularProgressIndicator(color: Colors.white)
+                        : const Text("Send Access Request", 
+                            style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
                     ),
                   ),
                 ],

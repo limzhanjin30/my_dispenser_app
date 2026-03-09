@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../modals/user_modal.dart'; // To access registeredUsers, globalPendingRequests, and globalConnections
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
 
 class PatientAccept extends StatefulWidget {
   final String userEmail;
@@ -10,77 +10,100 @@ class PatientAccept extends StatefulWidget {
 }
 
 class _PatientAcceptState extends State<PatientAccept> {
-  // Logic to filter the global list for requests specifically for this patient
-  List<Map<String, String>> get myRequests => globalPendingRequests
-      .where((req) => req['receiverEmail'] == widget.userEmail)
-      .toList();
-
-  void _handleAction(int index, bool isAccepted) {
-    var request = myRequests[index];
-    String senderName = request['senderName']!;
-
-    if (isAccepted) {
-      setState(() {
-        // --- NORMALIZED DATA STORAGE ---
-        globalConnections.add({
+  
+  // --- NEW: LOGIC TO HANDLE FIREBASE ACTIONS ---
+  Future<void> _handleAction(String requestId, Map<String, dynamic> requestData, bool isAccepted) async {
+    try {
+      if (isAccepted) {
+        // 1. Create a permanent connection in Firestore
+        await FirebaseFirestore.instance.collection('connections').add({
           "patientEmail": widget.userEmail.trim().toLowerCase(),
-          "caregiverEmail": request['senderEmail']!.trim().toLowerCase(),
+          "caregiverEmail": requestData['senderEmail']!.trim().toLowerCase(),
+          "connectedAt": FieldValue.serverTimestamp(),
         });
-      });
+      }
+
+      // 2. Delete the request from the 'requests' collection
+      await FirebaseFirestore.instance.collection('requests').doc(requestId).delete();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(isAccepted ? "Connection established!" : "Request declined"),
+            backgroundColor: isAccepted ? Colors.teal : Colors.redAccent,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint("Error handling request: $e");
     }
-
-    // Remove the request (use normalized check here too)
-    setState(() {
-      globalPendingRequests.removeWhere((req) =>
-          req['senderEmail']?.trim().toLowerCase() == request['senderEmail']?.trim().toLowerCase() &&
-          req['receiverEmail']?.trim().toLowerCase() == widget.userEmail.trim().toLowerCase());
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(isAccepted ? "Accepted request from $senderName" : "Declined $senderName"),
-        backgroundColor: isAccepted ? Colors.teal : Colors.redAccent,
-      ),
-    );
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFFF5F9FF),
-      appBar: AppBar(
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: const Text("Pending Requests",
-            style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-        backgroundColor: Colors.white,
-        elevation: 0.5,
-        centerTitle: true,
-      ),
-      body: myRequests.isEmpty
-          ? _buildEmptyState()
-          : SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(20, 30, 20, 20),
-              child: Column(
-                children: [
-                  ListView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: myRequests.length,
-                    itemBuilder: (context, index) {
-                      final request = myRequests[index];
-                      return _buildRequestCard(index, request);
-                    },
-                  ),
-                ],
-              ),
+    // --- NEW: REAL-TIME STREAM OF REQUESTS ---
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection('requests')
+          .where('receiverEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .snapshots(),
+      builder: (context, snapshot) {
+        // Show loading while waiting for Firebase
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+
+        // Handle empty states
+        if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+          return Scaffold(
+            backgroundColor: const Color(0xFFF5F9FF),
+            appBar: _buildAppBar(),
+            body: _buildEmptyState(),
+          );
+        }
+
+        final requests = snapshot.data!.docs;
+
+        return Scaffold(
+          backgroundColor: const Color(0xFFF5F9FF),
+          appBar: _buildAppBar(),
+          body: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(20, 30, 20, 20),
+            child: Column(
+              children: [
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: requests.length,
+                  itemBuilder: (context, index) {
+                    var requestDoc = requests[index];
+                    var data = requestDoc.data() as Map<String, dynamic>;
+                    return _buildRequestCard(requestDoc.id, data);
+                  },
+                ),
+              ],
             ),
+          ),
+        );
+      },
     );
   }
 
-  Widget _buildRequestCard(int index, Map<String, String> request) {
+  PreferredSizeWidget _buildAppBar() {
+    return AppBar(
+      leading: IconButton(
+        icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
+        onPressed: () => Navigator.pop(context),
+      ),
+      title: const Text("Pending Requests",
+          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+      backgroundColor: Colors.white,
+      elevation: 0.5,
+      centerTitle: true,
+    );
+  }
+
+  Widget _buildRequestCard(String docId, Map<String, dynamic> request) {
     return Container(
       margin: const EdgeInsets.only(bottom: 15),
       padding: const EdgeInsets.all(15),
@@ -105,7 +128,6 @@ class _PatientAcceptState extends State<PatientAccept> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // --- BOLD ROLE AT TOP ---
                     Text(
                       request['senderRole']?.replaceAll('\n', ' ') ?? "User",
                       style: const TextStyle(
@@ -115,14 +137,9 @@ class _PatientAcceptState extends State<PatientAccept> {
                       ),
                     ),
                     const SizedBox(height: 4),
-                    // --- NAME + DESCRIPTION TEXT ---
                     Text(
                       "${request['requestText']}",
-                      style: const TextStyle(
-                        fontSize: 14, 
-                        color: Colors.black87,
-                        height: 1.3
-                      ),
+                      style: const TextStyle(fontSize: 14, color: Colors.black87, height: 1.3),
                     ),
                   ],
                 ),
@@ -134,7 +151,7 @@ class _PatientAcceptState extends State<PatientAccept> {
             children: [
               Expanded(
                 child: ElevatedButton(
-                  onPressed: () => _handleAction(index, true),
+                  onPressed: () => _handleAction(docId, request, true),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.teal,
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -145,7 +162,7 @@ class _PatientAcceptState extends State<PatientAccept> {
               const SizedBox(width: 10),
               Expanded(
                 child: OutlinedButton(
-                  onPressed: () => _handleAction(index, false),
+                  onPressed: () => _handleAction(docId, request, false),
                   style: OutlinedButton.styleFrom(
                     side: const BorderSide(color: Colors.blueGrey),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),

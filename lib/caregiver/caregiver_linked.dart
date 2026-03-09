@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import '../modals/user_modal.dart'; // To access registeredUsers, globalPendingRequests, and globalConnections
-import 'caregiver_schedule_editor.dart'; // Ensure this import is present
+import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
+import 'caregiver_schedule_editor.dart';
 
 class CaregiverLinked extends StatefulWidget {
   final String userEmail; 
@@ -12,89 +12,132 @@ class CaregiverLinked extends StatefulWidget {
 
 class _CaregiverLinkedState extends State<CaregiverLinked> {
   
-  List<Map<String, String>> get connectedProfiles {
-    final myPatientEmails = globalConnections
-        .where((conn) => 
-            conn['caregiverEmail']?.trim().toLowerCase() == widget.userEmail.trim().toLowerCase())
-        .map((conn) => conn['patientEmail']?.trim().toLowerCase())
-        .toList();
-
-    return registeredUsers
-        .where((user) => 
-            myPatientEmails.contains(user['email']?.trim().toLowerCase()))
-        .map((user) => {
-              "name": user['name'] ?? "Unknown User",
-              "role": user['role'] ?? "Patient",
-              "email": user['email'] ?? "",
-            })
-        .toList();
+  // --- NEW: LOGIC TO DELETE CONNECTION FROM FIREBASE ---
+  Future<void> _unlinkProfile(String docId, String name) async {
+    try {
+      await FirebaseFirestore.instance.collection('connections').doc(docId).delete();
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Access revoked for $name"), backgroundColor: Colors.redAccent),
+        );
+      }
+    } catch (e) {
+      debugPrint("Error unlinking patient: $e");
+    }
   }
 
-  void _unlinkProfile(String email, String name) {
-    setState(() {
-      globalConnections.removeWhere((conn) => 
-        conn['caregiverEmail']?.trim().toLowerCase() == widget.userEmail.trim().toLowerCase() && 
-        conn['patientEmail']?.trim().toLowerCase() == email.trim().toLowerCase());
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("Unlinked from $name"), backgroundColor: Colors.redAccent),
+  // Helper function to handle navigation
+  void _navigateToEditor(String targetEmail) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => CaregiverScheduleEditor(
+          userEmail: widget.userEmail, 
+          initialTargetEmail: targetEmail, 
+        ),
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final profiles = connectedProfiles;
+    // --- NEW: REAL-TIME STREAM OF PATIENTS LINKED TO THIS CAREGIVER ---
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection('connections')
+          .where('caregiverEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
 
-    return Scaffold(
-      backgroundColor: const Color(0xFFF5F9FF),
-      appBar: AppBar(
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: const Text("Linked Patients", 
-          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-        backgroundColor: Colors.white,
-        elevation: 0.5,
-        centerTitle: true,
-      ),
-      body: profiles.isEmpty 
-      ? _buildEmptyState() 
-      : SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              "Monitored Patients",
-              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              "Select a patient profile to manage their medication dispenser schedule.",
-              style: TextStyle(color: Colors.black54, fontSize: 14),
-            ),
-            const SizedBox(height: 25),
+        if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+          return Scaffold(
+            backgroundColor: const Color(0xFFF5F9FF),
+            appBar: _buildAppBar(),
+            body: _buildEmptyState(),
+          );
+        }
 
-            ListView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: profiles.length,
-              itemBuilder: (context, index) {
-                return _buildPatientCard(profiles[index]);
-              },
+        final connectionDocs = snapshot.data!.docs;
+
+        return Scaffold(
+          backgroundColor: const Color(0xFFF5F9FF),
+          appBar: _buildAppBar(),
+          body: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  "Monitored Patients",
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  "Select a patient profile to manage their medication dispenser schedule.",
+                  style: TextStyle(color: Colors.black54, fontSize: 14),
+                ),
+                const SizedBox(height: 25),
+
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: connectionDocs.length,
+                  itemBuilder: (context, index) {
+                    var connData = connectionDocs[index].data() as Map<String, dynamic>;
+                    String patientEmail = connData['patientEmail'];
+                    String docId = connectionDocs[index].id;
+
+                    // Fetch the Patient's detailed info from the 'users' collection
+                    return FutureBuilder<QuerySnapshot>(
+                      future: FirebaseFirestore.instance
+                          .collection('users')
+                          .where('email', isEqualTo: patientEmail)
+                          .limit(1)
+                          .get(),
+                      builder: (context, userSnapshot) {
+                        if (!userSnapshot.hasData || userSnapshot.data!.docs.isEmpty) {
+                          return const SizedBox.shrink();
+                        }
+
+                        var userData = userSnapshot.data!.docs.first.data() as Map<String, dynamic>;
+                        return _buildPatientCard(
+                          docId, 
+                          userData['name'] ?? "Unknown User", 
+                          patientEmail
+                        );
+                      },
+                    );
+                  },
+                ),
+              ],
             ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 
-  Widget _buildPatientCard(Map<String, String> profile) {
+  PreferredSizeWidget _buildAppBar() {
+    return AppBar(
+      leading: IconButton(
+        icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
+        onPressed: () => Navigator.pop(context),
+      ),
+      title: const Text("Linked Patients", 
+        style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+      backgroundColor: Colors.white,
+      elevation: 0.5,
+      centerTitle: true,
+    );
+  }
+
+  Widget _buildPatientCard(String docId, String name, String email) {
     return GestureDetector(
-      // Tapping the card also navigates to the schedule editor
-      onTap: () => _navigateToEditor(profile['email']!),
+      onTap: () => _navigateToEditor(email),
       child: Container(
         margin: const EdgeInsets.only(bottom: 15),
         padding: const EdgeInsets.all(18),
@@ -117,8 +160,7 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(profile['name']!, 
-                        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+                      Text(name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
                       const Text("Linked Patient", 
                         style: TextStyle(color: Colors.blue, fontSize: 12, fontWeight: FontWeight.w600)),
                     ],
@@ -130,14 +172,13 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
             const SizedBox(height: 15),
             const Divider(),
             const SizedBox(height: 10),
-            Text("Email: ${profile['email']}", style: const TextStyle(color: Colors.black54, fontSize: 13)),
+            Text("Email: $email", style: const TextStyle(color: Colors.black54, fontSize: 13)),
             const SizedBox(height: 20),
             Row(
               children: [
-                // Manage Schedule Button
                 Expanded(
                   child: ElevatedButton.icon(
-                    onPressed: () => _navigateToEditor(profile['email']!),
+                    onPressed: () => _navigateToEditor(email),
                     icon: const Icon(Icons.calendar_month, size: 18, color: Colors.white),
                     label: const Text("Manage Schedule", style: TextStyle(color: Colors.white)),
                     style: ElevatedButton.styleFrom(
@@ -148,9 +189,8 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
                   ),
                 ),
                 const SizedBox(width: 10),
-                // Remove Patient Button
                 OutlinedButton(
-                  onPressed: () => _unlinkProfile(profile['email']!, profile['name']!),
+                  onPressed: () => _unlinkProfile(docId, name),
                   style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.redAccent,
                     side: const BorderSide(color: Colors.redAccent),
@@ -167,24 +207,16 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
     );
   }
 
-  // Helper function to handle navigation
-  // --- UPDATED NAVIGATION LOGIC ---
-  void _navigateToEditor(String targetEmail) {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => CaregiverScheduleEditor(
-          userEmail: widget.userEmail, 
-          // FIXED: Changed from targetPatientEmail to initialTargetEmail
-          initialTargetEmail: targetEmail, 
-        ),
-      ),
-    );
-  }
-
   Widget _buildEmptyState() {
-    return const Center(
-      child: Text("No monitored patients yet.", style: TextStyle(color: Colors.grey)),
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.people_outline, size: 80, color: Colors.grey[300]),
+          const SizedBox(height: 15),
+          const Text("No monitored patients yet.", style: TextStyle(color: Colors.grey, fontSize: 16, fontWeight: FontWeight.w500)),
+        ],
+      ),
     );
   }
 }
