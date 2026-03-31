@@ -4,7 +4,7 @@ import 'package:intl/intl.dart';
 import '../custom_bottom_nav.dart';
 import '../login.dart';
 import 'caregiver_linked.dart';
-import 'caregiver_adherence.dart';
+import 'caregiver_schedule_editor.dart';
 
 class CaregiverDashboard extends StatefulWidget {
   final String userEmail;
@@ -17,42 +17,43 @@ class CaregiverDashboard extends StatefulWidget {
 class _CaregiverDashboardState extends State<CaregiverDashboard> {
   String fullName = "Caregiver";
   int _linkedPatientCount = 0;
-  int _pendingDosesToday = 0; 
-  List<Map<String, dynamic>> _recentActivity = [];
+  int _actionRequiredCount = 0; 
+  List<Map<String, dynamic>> _machineActivityFeed = [];
   bool _isLoading = true;
 
   @override
   void initState() {
     super.initState();
-    _setupRealTimeListeners();
+    _setupRealTimeSync();
   }
 
-  void _setupRealTimeListeners() {
-    final String cleanEmail = widget.userEmail.trim().toLowerCase();
+  // --- ARCHITECTURE: MULTI-MACHINE REAL-TIME SYNC ---
+  void _setupRealTimeSync() {
+    final String caregiverEmail = widget.userEmail.trim().toLowerCase();
     final DateTime now = DateTime.now();
-    // Normalize today's date for range comparison
+    final String todayStr = DateFormat('yyyy-MM-dd').format(now);
     final DateTime todayMidnight = DateTime(now.year, now.month, now.day);
 
     FirebaseFirestore.instance
         .collection('users')
-        .where('email', isEqualTo: cleanEmail)
+        .where('email', isEqualTo: caregiverEmail)
         .limit(1)
         .snapshots()
         .listen((snap) {
-      if (snap.docs.isNotEmpty) {
+      if (snap.docs.isNotEmpty && mounted) {
         setState(() => fullName = snap.docs.first.get('name') ?? "Caregiver");
       }
     });
 
     FirebaseFirestore.instance
         .collection('connections')
-        .where('caregiverEmail', isEqualTo: cleanEmail)
+        .where('caregiverEmail', isEqualTo: caregiverEmail)
         .snapshots()
         .listen((connectionSnap) async {
       
-      int patientCount = connectionSnap.docs.length;
-      int pendingAggregate = 0;
-      List<Map<String, dynamic>> activities = [];
+      int totalPatients = connectionSnap.docs.length;
+      int urgentActions = 0;
+      List<Map<String, dynamic>> consolidatedActivity = [];
 
       for (var doc in connectionSnap.docs) {
         String pEmail = doc.get('patientEmail').toString().toLowerCase();
@@ -62,77 +63,126 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
             .where('email', isEqualTo: pEmail)
             .limit(1)
             .get();
-        String pName = pUserSnap.docs.isNotEmpty ? pUserSnap.docs.first.get('name') : "Unknown";
+        
+        if (pUserSnap.docs.isEmpty) continue;
+        var pData = pUserSnap.docs.first.data();
+        String pName = pData['name'] ?? "Unknown";
+        String? machineId = pData['linkedMachineId'];
 
-        var scheduleDoc = await FirebaseFirestore.instance.collection('schedules').doc(pEmail).get();
-        if (scheduleDoc.exists) {
-          List<dynamic> slots = scheduleDoc.data()?['slots'] ?? [];
-          for (var slot in slots) {
-            if (slot['name'] == null || slot['name'].toString().contains("Empty Slot")) continue;
+        if (machineId == null || machineId.isEmpty) continue;
 
-            // --- STEP 1: VALIDATE CURRENT DAY IS IN RANGE ---
-            DateTime start = DateTime.parse(slot['startDate'] ?? now.toString());
-            DateTime end = DateTime.parse(slot['endDate'] ?? now.toString());
-            DateTime startDate = DateTime(start.year, start.month, start.day);
-            DateTime endDate = DateTime(end.year, end.month, end.day);
+        var machineDoc = await FirebaseFirestore.instance.collection('machines').doc(machineId).get();
+        if (machineDoc.exists) {
+          List<dynamic> slots = List.from(machineDoc.data()?['slots'] ?? []);
+          bool needsCleanupUpdate = false;
 
-            if (todayMidnight.isBefore(startDate) || todayMidnight.isAfter(endDate)) continue;
+          for (int i = 0; i < slots.length; i++) {
+            var slot = slots[i];
+            
+            // SECURITY: Skip genuinely empty slots
+            if (slot['status'] == "Empty") continue;
 
-            bool isDone = slot['isDone'] ?? false;
-            String medName = slot['name'];
+            // 1. LOGIC: AUTO-FINISH SLOT WHEN DATE ENDS
+            DateTime endDate = DateTime.parse(slot['endDate'] ?? todayStr);
+            if (now.isAfter(endDate.add(const Duration(days: 1))) && slot['status'] == "Occupied") {
+              slots[i]['status'] = "Finished";
+              slots[i]['isLocked'] = false; // Physically release hardware
+              needsCleanupUpdate = true;
+            }
+
+            if (slot['patientEmail'] != pEmail) continue;
+
+            // Date Range Filter for Today's Activity
+            DateTime start = DateTime.parse(slot['startDate'] ?? todayStr);
+            if (todayMidnight.isBefore(DateTime(start.year, start.month, start.day)) || 
+                todayMidnight.isAfter(endDate)) continue;
+
+            String med = slot['medDetails'] ?? "Medication";
             List<String> times = List<String>.from(slot['times'] ?? []);
+            bool isTakenToday = slot['lastTakenDate'] == todayStr;
+            bool isPhysicallyEmpty = slot['isDone'] ?? false;
+            bool isFinishedStatus = slot['status'] == "Finished";
 
-            for (String timeStr in times) {
-              DateTime doseTimeToday;
+            for (String t in times) {
+              DateTime scheduledDose;
               try {
-                DateTime parsedTime = DateFormat("hh:mm a").parse(timeStr);
-                doseTimeToday = DateTime(now.year, now.month, now.day, parsedTime.hour, parsedTime.minute);
-              } catch (e) {
-                continue;
+                DateTime parsed = DateFormat("hh:mm a").parse(t);
+                scheduledDose = DateTime(now.year, now.month, now.day, parsed.hour, parsed.minute);
+              } catch (e) { continue; }
+
+              // 2. LOGIC: REFILL ALERT (Only for active "Occupied" slots)
+              Duration timeUntilDose = scheduledDose.difference(now);
+              if (!isTakenToday && !isFinishedStatus && isPhysicallyEmpty && timeUntilDose.inMinutes <= 60 && timeUntilDose.inMinutes > 0) {
+                urgentActions++;
+                consolidatedActivity.add({
+                  "patientEmail": pEmail,
+                  "msg": "URGENT REFILL: $pName",
+                  "sub": "$med due in ${timeUntilDose.inMinutes}m (Slot ${slot['slot']})",
+                  "icon": Icons.assignment_return,
+                  "color": Colors.deepOrange,
+                  "timestamp": scheduledDose,
+                });
               }
 
-              if (isDone) {
-                activities.add({
+              // 3. LOGIC: FEED STATUS (Taken / Missed / Upcoming / Finished)
+              DateTime graceLimit = scheduledDose.add(const Duration(minutes: 30));
+              
+              if (isFinishedStatus) {
+                // Display finished courses as successfully completed records
+                consolidatedActivity.add({
                   "patientEmail": pEmail,
-                  "msg": "$pName ($pEmail) took $medName",
-                  "time": "Today, $timeStr",
-                  "icon": Icons.check_circle,
-                  "color": Colors.green,
+                  "msg": "$pName: Course Finished",
+                  "sub": "$med course completed successfully.",
+                  "icon": Icons.verified,
+                  "color": Colors.blue,
+                  "timestamp": scheduledDose,
                 });
-              } else if (now.isAfter(doseTimeToday)) {
-                // Time passed and NOT done = MISSED
-                pendingAggregate++;
-                activities.add({
+              } else if (isTakenToday) {
+                consolidatedActivity.add({
                   "patientEmail": pEmail,
-                  "msg": "$pName ($pEmail) missed $medName",
-                  "time": "Today, $timeStr",
-                  "icon": Icons.error,
+                  "msg": "$pName took $med",
+                  "sub": "${(slot['adherenceStatus'] ?? "Taken").toUpperCase()} (Slot ${slot['slot']})",
+                  "icon": slot['adherenceStatus'] == "Late" ? Icons.priority_high : Icons.check_circle,
+                  "color": slot['adherenceStatus'] == "Late" ? Colors.orange : Colors.green,
+                  "timestamp": scheduledDose,
+                });
+              } else if (now.isAfter(graceLimit)) {
+                urgentActions++;
+                consolidatedActivity.add({
+                  "patientEmail": pEmail,
+                  "msg": "$pName MISSED $med",
+                  "sub": "Scheduled for $t • Action Required",
+                  "icon": Icons.error_outline,
                   "color": Colors.red,
+                  "timestamp": scheduledDose,
                 });
               } else {
-                // Time has NOT arrived yet = UPCOMING
-                pendingAggregate++;
-                activities.add({
+                consolidatedActivity.add({
                   "patientEmail": pEmail,
-                  "msg": '$pName ($pEmail) has "$medName" coming up at $timeStr',
-                  "time": "Today",
-                  "icon": Icons.access_time_filled,
+                  "msg": '$pName: Upcoming $med',
+                  "sub": "Due today at $t",
+                  "icon": Icons.watch_later,
                   "color": Colors.blueGrey,
+                  "timestamp": scheduledDose,
                 });
               }
             }
           }
+
+          // Trigger Autonomous Slot Cleanup in Firestore
+          if (needsCleanupUpdate) {
+            await FirebaseFirestore.instance.collection('machines').doc(machineId).update({'slots': slots});
+          }
         }
       }
 
-      // Sort activity: Missed/Upcoming doses first
-      activities.sort((a, b) => b['time'].compareTo(a['time']));
+      consolidatedActivity.sort((a, b) => (b['timestamp'] as DateTime).compareTo(a['timestamp'] as DateTime));
 
       if (mounted) {
         setState(() {
-          _linkedPatientCount = patientCount;
-          _pendingDosesToday = pendingAggregate;
-          _recentActivity = activities;
+          _linkedPatientCount = totalPatients;
+          _actionRequiredCount = urgentActions;
+          _machineActivityFeed = consolidatedActivity;
           _isLoading = false;
         });
       }
@@ -148,96 +198,93 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           icon: const Icon(Icons.logout, color: Colors.white, size: 20),
           onPressed: () => Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (context) => const LoginPage()), (route) => false),
         ),
-        backgroundColor: const Color(0xFF1A3B70),
-        elevation: 0,
-        title: const Text("Smart Med Dashboard", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
+        backgroundColor: const Color(0xFF1A3B70), elevation: 0,
+        title: const Text("Caregiver Hub", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
         actions: [
-          const Icon(Icons.notifications_none, color: Colors.white),
-          const SizedBox(width: 15),
-          Center(
-            child: Text(fullName, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+          Padding(
+            padding: const EdgeInsets.only(right: 20),
+            child: Center(child: Text(fullName, style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.bold))),
           ),
-          const SizedBox(width: 20),
         ],
       ),
       body: _isLoading 
-        ? const Center(child: CircularProgressIndicator())
-        : SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text("Caregiver Overview", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
-              const SizedBox(height: 25),
+        ? const Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70)))
+        : RefreshIndicator(
+          onRefresh: () async => _setupRealTimeSync(),
+          color: const Color(0xFF1A3B70),
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(25),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("Hardware Monitoring", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
+                const SizedBox(height: 20),
 
-              _buildStatCard("Linked Patients", _linkedPatientCount.toString(), Icons.person_add, Colors.teal),
-              const SizedBox(height: 15),
-              _buildStatCard("Total Doses (Today)", _pendingDosesToday.toString(), Icons.warning_amber_rounded, Colors.orange),
+                Row(children: [
+                  Expanded(child: _buildStatCard("Linked Patients", _linkedPatientCount.toString(), Icons.people, Colors.teal)),
+                  const SizedBox(width: 15),
+                  Expanded(child: _buildStatCard("Action Required", _actionRequiredCount.toString(), Icons.notification_important, Colors.red)),
+                ]),
 
-              const SizedBox(height: 35),
-              const Text("Adherence Activity Feed", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 15),
+                const SizedBox(height: 35),
+                const Text("Live Activity Feed", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 15),
 
-              if (_recentActivity.isEmpty)
-                const Center(child: Text("No medication activity for today.", style: TextStyle(color: Colors.grey)))
-              else
-                ..._recentActivity.take(10).map((act) => _buildActivityTile(
-                  act['msg'], 
-                  act['time'], 
-                  act['icon'], 
-                  act['color'],
-                  act['patientEmail'], 
-                )),
+                if (_machineActivityFeed.isEmpty)
+                  const Center(child: Text("No machine activity detected today.", style: TextStyle(color: Colors.grey, fontSize: 13)))
+                else
+                  ..._machineActivityFeed.take(15).map((activity) => _buildActivityCard(activity)),
 
-              const SizedBox(height: 40),
-              SizedBox(
-                width: double.infinity, height: 55,
-                child: ElevatedButton(
-                  onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => CaregiverLinked(userEmail: widget.userEmail))),
-                  style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A3B70), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
-                  child: const Text("Manage Patient Access", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 30),
+                SizedBox(
+                  width: double.infinity, height: 55,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => CaregiverLinked(userEmail: widget.userEmail))),
+                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A3B70), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+                    child: const Text("Manage Patient Access", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       bottomNavigationBar: CustomBottomNavBar(currentIndex: 0, role: "Caregiver", userEmail: widget.userEmail),
     );
   }
 
-  Widget _buildStatCard(String title, String value, IconData icon, Color color) {
+  Widget _buildStatCard(String title, String val, IconData icon, Color color) {
     return Container(
       padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(15), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)]),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title, style: TextStyle(color: Colors.grey[600], fontSize: 14)),
-            const SizedBox(height: 5),
-            Text(value, style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
-          ]),
-          Icon(icon, color: color, size: 35),
-        ],
-      ),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(15), border: Border.all(color: Colors.grey.shade100)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Icon(icon, color: color, size: 24),
+        const SizedBox(height: 10),
+        Text(val, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+        Text(title, style: TextStyle(color: Colors.grey[600], fontSize: 11, fontWeight: FontWeight.w500)),
+      ]),
     );
   }
 
-  Widget _buildActivityTile(String msg, String time, IconData icon, Color iconColor, String patientEmail) {
+  Widget _buildActivityCard(Map<String, dynamic> act) {
+    bool isUrgent = act['msg'].contains("URGENT") || act['color'] == Colors.red;
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      elevation: isUrgent ? 2 : 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12), 
+        side: BorderSide(color: isUrgent ? Colors.red.shade100 : Colors.grey.shade100, width: isUrgent ? 2 : 1)
+      ),
       child: ListTile(
-        leading: Icon(icon, color: iconColor),
-        title: Text(msg, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)), 
-        subtitle: Text(time, style: const TextStyle(fontSize: 11)),
-        trailing: const Icon(Icons.chevron_right, size: 18),
-        onTap: () {
-          Navigator.push(
-            context, 
-            MaterialPageRoute(builder: (context) => CaregiverAdherence(userEmail: widget.userEmail))
-          );
-        },
+        leading: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(color: act['color'].withOpacity(0.1), shape: BoxShape.circle),
+          child: Icon(act['icon'], color: act['color'], size: 20),
+        ),
+        title: Text(act['msg'], style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: isUrgent ? Colors.red.shade900 : Colors.black)), 
+        subtitle: Text(act['sub'], style: const TextStyle(fontSize: 11, color: Colors.black54)),
+        trailing: const Icon(Icons.chevron_right, size: 16, color: Colors.grey),
+        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (context) => CaregiverScheduleEditor(userEmail: widget.userEmail, initialTargetEmail: act['patientEmail']))),
       ),
     );
   }

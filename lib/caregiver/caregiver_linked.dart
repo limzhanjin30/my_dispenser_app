@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'caregiver_schedule_editor.dart';
 
 class CaregiverLinked extends StatefulWidget {
@@ -12,11 +12,9 @@ class CaregiverLinked extends StatefulWidget {
 
 class _CaregiverLinkedState extends State<CaregiverLinked> {
   
-  // --- NEW: LOGIC TO DELETE CONNECTION FROM FIREBASE ---
   Future<void> _unlinkProfile(String docId, String name) async {
     try {
       await FirebaseFirestore.instance.collection('connections').doc(docId).delete();
-      
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text("Access revoked for $name"), backgroundColor: Colors.redAccent),
@@ -27,7 +25,6 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
     }
   }
 
-  // Helper function to handle navigation
   void _navigateToEditor(String targetEmail) {
     Navigator.push(
       context,
@@ -42,7 +39,6 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
 
   @override
   Widget build(BuildContext context) {
-    // --- NEW: REAL-TIME STREAM OF PATIENTS LINKED TO THIS CAREGIVER ---
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance
           .collection('connections')
@@ -66,55 +62,38 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
         return Scaffold(
           backgroundColor: const Color(0xFFF5F9FF),
           appBar: _buildAppBar(),
-          body: SingleChildScrollView(
+          body: ListView.builder(
             padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  "Monitored Patients",
-                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  "Select a patient profile to manage their medication dispenser schedule.",
-                  style: TextStyle(color: Colors.black54, fontSize: 14),
-                ),
-                const SizedBox(height: 25),
+            itemCount: connectionDocs.length,
+            itemBuilder: (context, index) {
+              var connData = connectionDocs[index].data() as Map<String, dynamic>;
+              String patientEmail = connData['patientEmail'];
+              String docId = connectionDocs[index].id;
 
-                ListView.builder(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  itemCount: connectionDocs.length,
-                  itemBuilder: (context, index) {
-                    var connData = connectionDocs[index].data() as Map<String, dynamic>;
-                    String patientEmail = connData['patientEmail'];
-                    String docId = connectionDocs[index].id;
+              // RELATIONAL LOOKUP: Fetch patient name and hardware status
+              return FutureBuilder<QuerySnapshot>(
+                future: FirebaseFirestore.instance
+                    .collection('users')
+                    .where('email', isEqualTo: patientEmail)
+                    .limit(1)
+                    .get(),
+                builder: (context, userSnapshot) {
+                  if (!userSnapshot.hasData || userSnapshot.data!.docs.isEmpty) {
+                    return const SizedBox.shrink();
+                  }
 
-                    // Fetch the Patient's detailed info from the 'users' collection
-                    return FutureBuilder<QuerySnapshot>(
-                      future: FirebaseFirestore.instance
-                          .collection('users')
-                          .where('email', isEqualTo: patientEmail)
-                          .limit(1)
-                          .get(),
-                      builder: (context, userSnapshot) {
-                        if (!userSnapshot.hasData || userSnapshot.data!.docs.isEmpty) {
-                          return const SizedBox.shrink();
-                        }
+                  var userData = userSnapshot.data!.docs.first.data() as Map<String, dynamic>;
+                  String? machineId = userData['linkedMachineId'];
 
-                        var userData = userSnapshot.data!.docs.first.data() as Map<String, dynamic>;
-                        return _buildPatientCard(
-                          docId, 
-                          userData['name'] ?? "Unknown User", 
-                          patientEmail
-                        );
-                      },
-                    );
-                  },
-                ),
-              ],
-            ),
+                  return _buildPatientCard(
+                    docId, 
+                    userData['name'] ?? "Unknown User", 
+                    patientEmail,
+                    machineId
+                  );
+                },
+              );
+            },
           ),
         );
       },
@@ -128,81 +107,101 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
         onPressed: () => Navigator.pop(context),
       ),
       title: const Text("Linked Patients", 
-        style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+        style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)),
       backgroundColor: Colors.white,
       elevation: 0.5,
       centerTitle: true,
     );
   }
 
-  Widget _buildPatientCard(String docId, String name, String email) {
-    return GestureDetector(
-      onTap: () => _navigateToEditor(email),
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 15),
-        padding: const EdgeInsets.all(18),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(15),
-          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const CircleAvatar(
-                  backgroundColor: Color(0xFFE3F2FD),
-                  child: Icon(Icons.person_outline, color: Color(0xFF1A3B70)),
+  Widget _buildPatientCard(String docId, String name, String email, String? machineId) {
+    bool isHardwareReady = machineId != null && machineId.isNotEmpty;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 15),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(15),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const CircleAvatar(
+                backgroundColor: Color(0xFFE3F2FD),
+                child: Icon(Icons.person_outline, color: Color(0xFF1A3B70)),
+              ),
+              const SizedBox(width: 15),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 2),
+                    Text(email, style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                  ],
                 ),
-                const SizedBox(width: 15),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
-                      const Text("Linked Patient", 
-                        style: TextStyle(color: Colors.blue, fontSize: 12, fontWeight: FontWeight.w600)),
-                    ],
-                  ),
+              ),
+              // NEW: Hardware Status Indicator
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isHardwareReady ? Colors.green.shade50 : Colors.orange.shade50,
+                  borderRadius: BorderRadius.circular(8),
                 ),
-                const Icon(Icons.chevron_right, color: Colors.grey),
-              ],
-            ),
-            const SizedBox(height: 15),
-            const Divider(),
-            const SizedBox(height: 10),
-            Text("Email: $email", style: const TextStyle(color: Colors.black54, fontSize: 13)),
-            const SizedBox(height: 20),
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: () => _navigateToEditor(email),
-                    icon: const Icon(Icons.calendar_month, size: 18, color: Colors.white),
-                    label: const Text("Manage Schedule", style: TextStyle(color: Colors.white)),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF1A3B70),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                child: Row(
+                  children: [
+                    Icon(
+                      isHardwareReady ? Icons.check_circle : Icons.warning_amber_rounded,
+                      size: 12, 
+                      color: isHardwareReady ? Colors.green : Colors.orange,
                     ),
-                  ),
+                    const SizedBox(width: 4),
+                    Text(
+                      isHardwareReady ? "Hardware Linked" : "No Hardware",
+                      style: TextStyle(
+                        fontSize: 10, 
+                        fontWeight: FontWeight.bold, 
+                        color: isHardwareReady ? Colors.green : Colors.orange.shade800
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 10),
-                OutlinedButton(
-                  onPressed: () => _unlinkProfile(docId, name),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.redAccent,
-                    side: const BorderSide(color: Colors.redAccent),
-                    padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 15),
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: () => _navigateToEditor(email),
+                  icon: const Icon(Icons.settings_suggest, size: 18, color: Colors.white),
+                  label: const Text("Configure Bins", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1A3B70),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                   ),
-                  child: const Icon(Icons.link_off, size: 18),
                 ),
-              ],
-            ),
-          ],
-        ),
+              ),
+              const SizedBox(width: 10),
+              OutlinedButton(
+                onPressed: () => _unlinkProfile(docId, name),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.redAccent,
+                  side: const BorderSide(color: Colors.redAccent),
+                  padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 15),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                child: const Icon(Icons.link_off, size: 18),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -214,7 +213,8 @@ class _CaregiverLinkedState extends State<CaregiverLinked> {
         children: [
           Icon(Icons.people_outline, size: 80, color: Colors.grey[300]),
           const SizedBox(height: 15),
-          const Text("No monitored patients yet.", style: TextStyle(color: Colors.grey, fontSize: 16, fontWeight: FontWeight.w500)),
+          const Text("No monitored patients yet.", 
+            style: TextStyle(color: Colors.grey, fontSize: 16, fontWeight: FontWeight.w500)),
         ],
       ),
     );

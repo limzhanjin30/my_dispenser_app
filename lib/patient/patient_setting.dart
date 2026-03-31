@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart'; // --- ADDED FIRESTORE IMPORT ---
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../custom_bottom_nav.dart';
 import '../login.dart';
-// Note: Removed user_model.dart import since we are fetching from Firebase now
 import 'patient_dashboard.dart';
 import 'patient_request.dart';
 import 'patient_linked.dart';
 import 'patient_accept.dart';
+import 'patient_link_machine.dart'; // --- IMPORT LINK MACHINE PAGE ---
 
 class PatientSetting extends StatefulWidget {
   final String userEmail;
@@ -18,6 +18,9 @@ class PatientSetting extends StatefulWidget {
 
 class _PatientSettingState extends State<PatientSetting> {
   String fullName = "Patient";
+  String? linkedMachineId; // --- NEW STATE VARIABLE ---
+  bool _isLoading = true;
+
   bool medReminders = true;
   bool refillAlerts = true;
   bool missedDoseNotify = true;
@@ -27,28 +30,35 @@ class _PatientSettingState extends State<PatientSetting> {
   @override
   void initState() {
     super.initState();
-    _fetchFirestoreData(); // --- TRIGGER ASYNC FETCH ---
+    _fetchFirestoreData();
   }
 
-  // --- NEW ASYNC FIRESTORE FETCH LOGIC ---
+  // --- FETCH USER DETAILS & MACHINE STATUS ---
   Future<void> _fetchFirestoreData() async {
     final String cleanEmail = widget.userEmail.trim().toLowerCase();
 
     try {
-      // Look into the 'users' collection where the email matches the logged-in user
-      QuerySnapshot userSnapshot = await FirebaseFirestore.instance
+      var userSnapshot = await FirebaseFirestore.instance
           .collection('users')
           .where('email', isEqualTo: cleanEmail)
           .limit(1)
           .get();
 
       if (userSnapshot.docs.isNotEmpty) {
-        setState(() {
-          fullName = userSnapshot.docs.first.get('name') ?? "Patient";
-        });
+        if (mounted) {
+          setState(() {
+            var data = userSnapshot.docs.first.data();
+            fullName = data['name'] ?? "Patient";
+            linkedMachineId = data['linkedMachineId']; // Fetch machine ID
+            _isLoading = false;
+          });
+        }
+      } else {
+        if (mounted) setState(() => _isLoading = false);
       }
     } catch (e) {
-      print("Error fetching user data: $e");
+      debugPrint("Error fetching settings data: $e");
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -62,23 +72,18 @@ class _PatientSettingState extends State<PatientSetting> {
           onPressed: () {
             Navigator.pushReplacement(
               context,
-              MaterialPageRoute(
-                builder: (context) =>
-                    PatientDashboard(userEmail: widget.userEmail),
-              ),
+              MaterialPageRoute(builder: (context) => PatientDashboard(userEmail: widget.userEmail)),
             );
           },
         ),
-        title: const Text(
-          "Settings",
-          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
-        ),
+        title: const Text("Settings", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
         backgroundColor: Colors.white,
         elevation: 0.5,
         centerTitle: true,
-        automaticallyImplyLeading: false,
       ),
-      body: SingleChildScrollView(
+      body: _isLoading 
+          ? const Center(child: CircularProgressIndicator())
+          : SingleChildScrollView(
         padding: const EdgeInsets.all(15),
         child: Column(
           children: [
@@ -92,17 +97,8 @@ class _PatientSettingState extends State<PatientSetting> {
                     child: Icon(Icons.person, size: 50, color: Colors.blue),
                   ),
                   const SizedBox(height: 10),
-                  Text(
-                    fullName, // --- NOW PULLS DYNAMICALLY FROM FIRESTORE ---
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  Text(
-                    widget.userEmail,
-                    style: const TextStyle(color: Colors.grey, fontSize: 13),
-                  ),
+                  Text(fullName, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  Text(widget.userEmail, style: const TextStyle(color: Colors.grey, fontSize: 13)),
                 ],
               ),
             ),
@@ -112,110 +108,56 @@ class _PatientSettingState extends State<PatientSetting> {
             _buildSection("Account Info", Icons.person_outline, [
               _buildListTile("Edit Profile"),
               _buildListTile("Change Password"),
-              _buildListTile("Security Questions"),
             ]),
 
             // --- CAREGIVER CONNECTIONS ---
             _buildSection("Caregiver Connections", Icons.people_alt_outlined, [
-              _buildListTile(
-                "Linked Caregiver/Healthcare Provider",
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) =>
-                          PatientLinked(userEmail: widget.userEmail),
-                    ),
-                  );
-                },
-              ),
-              _buildListTile(
-                "Caregiver/Healthcare Provider Access Requests",
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) =>
-                          PatientAccept(userEmail: widget.userEmail),
-                    ),
-                  );
-                },
-              ),
-              _buildListTile(
-                "Send Request to Caregiver/Healthcare Provider",
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) =>
-                          PatientRequest(userEmail: widget.userEmail),
-                    ),
-                  );
-                },
-              ),
+              _buildListTile("Linked Caregivers/Healthcare Provider", onTap: () {
+                Navigator.push(context, MaterialPageRoute(builder: (context) => PatientLinked(userEmail: widget.userEmail)));
+              }),
+              _buildListTile("Pending Requests", onTap: () {
+                Navigator.push(context, MaterialPageRoute(builder: (context) => PatientAccept(userEmail: widget.userEmail)));
+              }),
+              _buildListTile("Connect New Caregiver/Healthcare Provider", onTap: () {
+                Navigator.push(context, MaterialPageRoute(builder: (context) => PatientRequest(userEmail: widget.userEmail)));
+              }),
             ]),
 
-            // --- DEVICE SETTINGS ---
-            _buildSection(
-              "Device Settings (Crucial for Smart Dispenser)",
-              Icons.settings_outlined,
-              [
-                _buildListTile(
-                  "Connect Medicine Dispenser",
-                  trailingText: "Connected",
-                  dotColor: Colors.green,
-                ),
-                _buildListTile("Configure Wi-Fi"),
-                _buildListTile("Dispenser Volume"),
-              ],
-            ),
+            // --- DEVICE SETTINGS (UPDATED) ---
+            _buildSection("Hardware Settings", Icons.settings_outlined, [
+              _buildListTile(
+                "Medicine Dispenser Hardware",
+                trailingText: linkedMachineId != null ? "Linked ($linkedMachineId)" : "Not Connected",
+                dotColor: linkedMachineId != null ? Colors.green : Colors.orange,
+                onTap: () {
+                  // --- NAVIGATION TO LINK MACHINE PAGE ---
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (context) => PatientLinkMachine(userEmail: widget.userEmail)),
+                  );
+                },
+              ),
+              _buildListTile("Configure Wi-Fi"),
+              _buildListTile("Device Calibration"),
+            ]),
 
-            // --- NOTIFICATIONS & ALERTS ---
+            // --- NOTIFICATIONS ---
             _buildSection("Notifications & Alerts", Icons.notifications_none, [
-              _buildSwitchTile(
-                "Medication Reminders",
-                medReminders,
-                (v) => setState(() => medReminders = v),
-              ),
-              _buildSwitchTile(
-                "Refill Alerts",
-                refillAlerts,
-                (v) => setState(() => refillAlerts = v),
-              ),
-              _buildSwitchTile(
-                "Missed Dose Notifications",
-                missedDoseNotify,
-                (v) => setState(() => missedDoseNotify = v),
-              ),
-            ]),
-
-            // --- PRIVACY & SUPPORT ---
-            _buildSection("Privacy & Support", Icons.shield_outlined, [
-              _buildListTile("Privacy Policy"),
-              _buildListTile("Terms of Service"),
-              _buildListTile("Contact Support"),
+              _buildSwitchTile("Medication Reminders", medReminders, (v) => setState(() => medReminders = v)),
+              _buildSwitchTile("Missed Dose Alerts", missedDoseNotify, (v) => setState(() => missedDoseNotify = v)),
             ]),
 
             // --- DISPLAY & ACCESSIBILITY ---
-            _buildSection("Display & Accessibility", Icons.text_fields, [
-              _buildSwitchTile(
-                "Large Text Mode",
-                largeTextMode,
-                (v) => setState(() => largeTextMode = v),
-              ),
-              _buildSwitchTile(
-                "High Contrast",
-                highContrast,
-                (v) => setState(() => highContrast = v),
-              ),
+            _buildSection("Accessibility", Icons.text_fields, [
+              _buildSwitchTile("Large Text Mode", largeTextMode, (v) => setState(() => largeTextMode = v)),
+              _buildSwitchTile("High Contrast", highContrast, (v) => setState(() => highContrast = v)),
             ]),
 
             const SizedBox(height: 15),
 
             // --- LOGOUT ---
             SizedBox(
-              width: double.infinity,
-              height: 55,
+              width: double.infinity, height: 55,
               child: ElevatedButton(
                 onPressed: () {
                   Navigator.pushAndRemoveUntil(
@@ -224,20 +166,8 @@ class _PatientSettingState extends State<PatientSetting> {
                     (route) => false,
                   );
                 },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.red[400],
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: const Text(
-                  "Log Out",
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.red[400], shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+                child: const Text("Log Out", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
               ),
             ),
             const SizedBox(height: 30),
@@ -253,75 +183,38 @@ class _PatientSettingState extends State<PatientSetting> {
   }
 
   // --- UI HELPERS ---
-
   Widget _buildSection(String title, IconData icon, List<Widget> children) {
     return Container(
       margin: const EdgeInsets.only(bottom: 20),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(15),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.only(left: 15, top: 15, right: 15),
-            child: Row(
-              children: [
-                Icon(icon, color: const Color(0xFF1A3B70), size: 22),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.black87,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          ...children,
-          const SizedBox(height: 5),
-        ],
-      ),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(15), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)]),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Padding(
+          padding: const EdgeInsets.only(left: 15, top: 15, right: 15),
+          child: Row(children: [
+            Icon(icon, color: const Color(0xFF1A3B70), size: 22),
+            const SizedBox(width: 10),
+            Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.black87)),
+          ]),
+        ),
+        ...children,
+        const SizedBox(height: 5),
+      ]),
     );
   }
 
-  Widget _buildListTile(
-    String title, {
-    String? trailingText,
-    Color? dotColor,
-    VoidCallback? onTap,
-  }) {
+  Widget _buildListTile(String title, {String? trailingText, Color? dotColor, VoidCallback? onTap}) {
     return ListTile(
       dense: true,
-      title: Text(title, style: const TextStyle(fontSize: 14)),
+      title: Text(title, style: const TextStyle(fontSize: 13)),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           if (trailingText != null) ...[
-            Text(
-              trailingText,
-              style: const TextStyle(color: Colors.grey, fontSize: 12),
-            ),
+            Text(trailingText, style: const TextStyle(color: Colors.grey, fontSize: 11)),
             const SizedBox(width: 5),
-            if (dotColor != null)
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: dotColor,
-                  shape: BoxShape.circle,
-                ),
-              ),
+            if (dotColor != null) Container(width: 8, height: 8, decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle)),
           ],
-          const Icon(Icons.chevron_right, color: Colors.grey, size: 20),
+          const Icon(Icons.chevron_right, color: Colors.grey, size: 18),
         ],
       ),
       onTap: onTap,
@@ -331,7 +224,7 @@ class _PatientSettingState extends State<PatientSetting> {
   Widget _buildSwitchTile(String title, bool value, Function(bool) onChanged) {
     return ListTile(
       dense: true,
-      title: Text(title, style: const TextStyle(fontSize: 14)),
+      title: Text(title, style: const TextStyle(fontSize: 13)),
       trailing: Switch(
         value: value,
         onChanged: onChanged,

@@ -174,11 +174,6 @@ class _CaregiverSettingState extends State<CaregiverSetting> {
             ),
             const SizedBox(height: 20),
 
-            // --- DISPENSER MANAGEMENT ---
-            _buildSectionHeader("Dispenser Management"),
-            _buildSettingTile(Icons.wifi, "Linked Device: Machine-01"),
-            const SizedBox(height: 20),
-
             // --- ACCOUNT ---
             _buildSectionHeader("Account"),
             _buildSettingTile(Icons.lock_outline, "Profile & Security"),

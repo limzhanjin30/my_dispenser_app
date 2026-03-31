@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class PatientAccept extends StatefulWidget {
   final String userEmail;
@@ -11,19 +11,32 @@ class PatientAccept extends StatefulWidget {
 
 class _PatientAcceptState extends State<PatientAccept> {
   
-  // --- NEW: LOGIC TO HANDLE FIREBASE ACTIONS ---
+  // --- LOGIC: PROCESS INCOMING REQUESTS ---
   Future<void> _handleAction(String requestId, Map<String, dynamic> requestData, bool isAccepted) async {
     try {
       if (isAccepted) {
-        // 1. Create a permanent connection in Firestore
-        await FirebaseFirestore.instance.collection('connections').add({
-          "patientEmail": widget.userEmail.trim().toLowerCase(),
-          "caregiverEmail": requestData['senderEmail']!.trim().toLowerCase(),
+        String senderRole = requestData['senderRole'] ?? "";
+        String senderEmail = requestData['senderEmail']!.trim().toLowerCase();
+        String myEmail = widget.userEmail.trim().toLowerCase();
+
+        // 1. Prepare connection data based on the Sender's Role
+        Map<String, dynamic> connectionMap = {
+          "patientEmail": myEmail,
           "connectedAt": FieldValue.serverTimestamp(),
-        });
+        };
+
+        // Determine if this is a clinical or family connection
+        if (senderRole.contains("Healthcare")) {
+          connectionMap["healthcareEmail"] = senderEmail;
+        } else {
+          connectionMap["caregiverEmail"] = senderEmail;
+        }
+
+        // 2. Create the permanent link in 'connections'
+        await FirebaseFirestore.instance.collection('connections').add(connectionMap);
       }
 
-      // 2. Delete the request from the 'requests' collection
+      // 3. Remove the request from the 'requests' collection
       await FirebaseFirestore.instance.collection('requests').doc(requestId).delete();
 
       if (mounted) {
@@ -31,29 +44,28 @@ class _PatientAcceptState extends State<PatientAccept> {
           SnackBar(
             content: Text(isAccepted ? "Connection established!" : "Request declined"),
             backgroundColor: isAccepted ? Colors.teal : Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
           ),
         );
       }
     } catch (e) {
-      debugPrint("Error handling request: $e");
+      debugPrint("Error handling patient acceptance: $e");
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    // --- NEW: REAL-TIME STREAM OF REQUESTS ---
+    // REAL-TIME STREAM: Show requests sent to the current Patient
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance
           .collection('requests')
           .where('receiverEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
           .snapshots(),
       builder: (context, snapshot) {
-        // Show loading while waiting for Firebase
         if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+          return const Scaffold(body: Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70))));
         }
 
-        // Handle empty states
         if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
           return Scaffold(
             backgroundColor: const Color(0xFFF5F9FF),
@@ -67,22 +79,14 @@ class _PatientAcceptState extends State<PatientAccept> {
         return Scaffold(
           backgroundColor: const Color(0xFFF5F9FF),
           appBar: _buildAppBar(),
-          body: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(20, 30, 20, 20),
-            child: Column(
-              children: [
-                ListView.builder(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  itemCount: requests.length,
-                  itemBuilder: (context, index) {
-                    var requestDoc = requests[index];
-                    var data = requestDoc.data() as Map<String, dynamic>;
-                    return _buildRequestCard(requestDoc.id, data);
-                  },
-                ),
-              ],
-            ),
+          body: ListView.builder(
+            padding: const EdgeInsets.all(20),
+            itemCount: requests.length,
+            itemBuilder: (context, index) {
+              var requestDoc = requests[index];
+              var data = requestDoc.data() as Map<String, dynamic>;
+              return _buildRequestCard(requestDoc.id, data);
+            },
           ),
         );
       },
@@ -95,8 +99,8 @@ class _PatientAcceptState extends State<PatientAccept> {
         icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
         onPressed: () => Navigator.pop(context),
       ),
-      title: const Text("Pending Requests",
-          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+      title: const Text("Access Authorization",
+          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)),
       backgroundColor: Colors.white,
       elevation: 0.5,
       centerTitle: true,
@@ -104,23 +108,26 @@ class _PatientAcceptState extends State<PatientAccept> {
   }
 
   Widget _buildRequestCard(String docId, Map<String, dynamic> request) {
+    bool isDoctor = (request['senderRole'] ?? "").toString().contains("Healthcare");
+
     return Container(
       margin: const EdgeInsets.only(bottom: 15),
-      padding: const EdgeInsets.all(15),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(15),
         boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
       ),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
               CircleAvatar(
-                backgroundColor: Colors.grey[200],
+                backgroundColor: isDoctor ? const Color(0xFFE0F2F1) : const Color(0xFFE3F2FD),
                 child: Icon(
-                  request['senderRole'] == "Healthcare\nProvider" ? Icons.medical_services : Icons.person,
-                  color: Colors.teal,
+                  isDoctor ? Icons.medical_services : Icons.person_outline,
+                  color: isDoctor ? Colors.teal : const Color(0xFF1A3B70),
                 ),
               ),
               const SizedBox(width: 15),
@@ -129,17 +136,17 @@ class _PatientAcceptState extends State<PatientAccept> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      request['senderRole']?.replaceAll('\n', ' ') ?? "User",
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold, 
-                        fontSize: 16, 
-                        color: Color(0xFF1A3B70)
-                      ),
+                      request['senderName'] ?? "Unknown User",
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17),
                     ),
-                    const SizedBox(height: 4),
                     Text(
-                      "${request['requestText']}",
-                      style: const TextStyle(fontSize: 14, color: Colors.black87, height: 1.3),
+                      isDoctor ? "CLINICAL PROVIDER" : "FAMILY CAREGIVER",
+                      style: TextStyle(
+                        fontSize: 10, 
+                        fontWeight: FontWeight.bold, 
+                        color: isDoctor ? Colors.teal : Colors.blue,
+                        letterSpacing: 1.1
+                      ),
                     ),
                   ],
                 ),
@@ -147,6 +154,13 @@ class _PatientAcceptState extends State<PatientAccept> {
             ],
           ),
           const SizedBox(height: 15),
+          const Divider(),
+          const SizedBox(height: 10),
+          Text(
+            "${request['requestText']}",
+            style: const TextStyle(fontSize: 14, color: Colors.black87, height: 1.4),
+          ),
+          const SizedBox(height: 20),
           Row(
             children: [
               Expanded(
@@ -154,20 +168,23 @@ class _PatientAcceptState extends State<PatientAccept> {
                   onPressed: () => _handleAction(docId, request, true),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.teal,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                   ),
-                  child: const Text("Accept", style: TextStyle(color: Colors.white)),
+                  child: const Text("Authorize", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 12),
               Expanded(
                 child: OutlinedButton(
                   onPressed: () => _handleAction(docId, request, false),
                   style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.blueGrey,
                     side: const BorderSide(color: Colors.blueGrey),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                   ),
-                  child: const Text("Decline", style: TextStyle(color: Colors.blueGrey)),
+                  child: const Text("Decline", style: TextStyle(fontWeight: FontWeight.bold)),
                 ),
               ),
             ],
@@ -178,13 +195,14 @@ class _PatientAcceptState extends State<PatientAccept> {
   }
 
   Widget _buildEmptyState() {
-    return const Center(
+    return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.mark_email_read_outlined, size: 60, color: Colors.grey),
-          SizedBox(height: 10),
-          Text("No pending requests", style: TextStyle(color: Colors.grey, fontSize: 16)),
+          Icon(Icons.notifications_none_rounded, size: 80, color: Colors.grey[200]),
+          const SizedBox(height: 15),
+          const Text("Inbox Clear", style: TextStyle(color: Colors.grey, fontSize: 16, fontWeight: FontWeight.w500)),
+          const Text("New access requests will appear here.", style: TextStyle(color: Colors.grey, fontSize: 13)),
         ],
       ),
     );

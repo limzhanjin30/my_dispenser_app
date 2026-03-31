@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class PatientRequest extends StatefulWidget {
   final String userEmail; 
@@ -12,7 +12,7 @@ class PatientRequest extends StatefulWidget {
 class _PatientRequestState extends State<PatientRequest> {
   final TextEditingController _targetEmailController = TextEditingController();
   String patientName = "";
-  bool isLoading = false; // Added to show loading state during DB calls
+  bool isLoading = false;
 
   @override
   void initState() {
@@ -35,7 +35,7 @@ class _PatientRequestState extends State<PatientRequest> {
         });
       }
     } catch (e) {
-      print("Error fetching name: $e");
+      debugPrint("Error fetching name: $e");
     }
   }
 
@@ -49,27 +49,31 @@ class _PatientRequestState extends State<PatientRequest> {
     }
 
     if (targetEmail == myEmail) {
-      _showSnackBar("You cannot request access to your own account.", Colors.red);
+      _showSnackBar("You cannot request your own account.", Colors.red);
       return;
     }
 
     setState(() => isLoading = true);
 
     try {
-      // 1. Check if already linked in 'connections' collection
+      // 1. Check if already linked (Checking BOTH possible keys)
       var existingConn = await FirebaseFirestore.instance
           .collection('connections')
           .where('patientEmail', isEqualTo: myEmail)
-          .where('caregiverEmail', isEqualTo: targetEmail)
           .get();
 
-      if (existingConn.docs.isNotEmpty) {
+      bool alreadyLinked = existingConn.docs.any((doc) {
+        var data = doc.data();
+        return data['caregiverEmail'] == targetEmail || data['healthcareEmail'] == targetEmail;
+      });
+
+      if (alreadyLinked) {
         _showSnackBar("You are already linked to this profile.", Colors.blue);
         setState(() => isLoading = false);
         return;
       }
 
-      // 2. AUTO-ACCEPT LOGIC: Check if target already sent a request to ME
+      // 2. AUTO-ACCEPT HANDSHAKE: Check if target already sent a request to ME
       var incomingReq = await FirebaseFirestore.instance
           .collection('requests')
           .where('senderEmail', isEqualTo: targetEmail)
@@ -77,40 +81,48 @@ class _PatientRequestState extends State<PatientRequest> {
           .get();
 
       if (incomingReq.docs.isNotEmpty) {
-        // HANDSHAKE: Establish connection immediately
-        await FirebaseFirestore.instance.collection('connections').add({
-          "patientEmail": myEmail,
-          "caregiverEmail": targetEmail,
-          "connectedAt": FieldValue.serverTimestamp(),
-        });
+        String senderRole = incomingReq.docs.first.get('senderRole') ?? "";
 
-        // Delete the now-obsolete request
+        // Establish connection using correct role key
+        Map<String, dynamic> connectionData = {
+          "patientEmail": myEmail,
+          "connectedAt": FieldValue.serverTimestamp(),
+        };
+
+        if (senderRole.contains("Healthcare")) {
+          connectionData["healthcareEmail"] = targetEmail;
+        } else {
+          connectionData["caregiverEmail"] = targetEmail;
+        }
+
+        await FirebaseFirestore.instance.collection('connections').add(connectionData);
+
+        // Delete the redundant request
         await FirebaseFirestore.instance
             .collection('requests')
             .doc(incomingReq.docs.first.id)
             .delete();
 
-        _showSnackBar("Mutual request found! Connection established.", Colors.teal);
-        Navigator.pop(context);
+        _showSnackBar("Handshake complete! Connection established.", Colors.teal);
+        if (mounted) Navigator.pop(context);
         return;
       }
 
-      // 3. Verify the target user exists and is a Provider/Caregiver
-      var providerQuery = await FirebaseFirestore.instance
+      // 3. Verify target role and send outgoing request
+      var userQuery = await FirebaseFirestore.instance
           .collection('users')
           .where('email', isEqualTo: targetEmail)
+          .limit(1)
           .get();
 
-      if (providerQuery.docs.isEmpty) {
-        _showSnackBar("No user found with this email.", Colors.red);
+      if (userQuery.docs.isEmpty) {
+        _showSnackBar("No registered user found with this email.", Colors.red);
       } else {
-        var userDoc = providerQuery.docs.first;
+        var userDoc = userQuery.docs.first;
         String role = userDoc.get('role');
 
-        // Only allow connection to Caregiver or Healthcare Provider
         if (role == 'Caregiver' || role == 'Healthcare\nProvider') {
-          
-          // Check if I already sent a request
+          // Check for pending outgoing request
           var pending = await FirebaseFirestore.instance
               .collection('requests')
               .where('senderEmail', isEqualTo: myEmail)
@@ -118,24 +130,24 @@ class _PatientRequestState extends State<PatientRequest> {
               .get();
 
           if (pending.docs.isNotEmpty) {
-            _showSnackBar("Request is already pending.", Colors.orange);
+            _showSnackBar("A request is already pending for this user.", Colors.orange);
           } else {
-            // Create the request document
+            // Send request
             await FirebaseFirestore.instance.collection('requests').add({
               "senderEmail": myEmail,
               "senderName": patientName,
               "receiverEmail": targetEmail,
               "senderRole": "Patient",
-              "requestText": "$patientName ($myEmail) is requesting you to manage their dispenser.",
+              "requestText": "$patientName ($myEmail) wants to link with you.",
               "status": "pending",
               "createdAt": FieldValue.serverTimestamp(),
             });
 
             _showSnackBar("Request sent to $targetEmail ($role).", Colors.green);
-            Navigator.pop(context);
+            if (mounted) Navigator.pop(context);
           }
         } else {
-          _showSnackBar("You can only link with Caregivers or Doctors.", Colors.orange);
+          _showSnackBar("Patients can only link with Caregivers or Doctors.", Colors.orange);
         }
       }
     } catch (e) {
@@ -160,32 +172,30 @@ class _PatientRequestState extends State<PatientRequest> {
           icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
           onPressed: () => Navigator.pop(context),
         ),
-        title: const Text("Connect Provider", 
+        title: const Text("Link New Provider", 
           style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 18)),
-        backgroundColor: Colors.white,
-        elevation: 0.5,
-        centerTitle: true,
+        backgroundColor: Colors.white, elevation: 0.5, centerTitle: true,
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(25),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Link a Caregiver/Doctor", 
+            const Text("Secure Connection", 
               style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
             const SizedBox(height: 10),
             const Text(
-              "Enter the email of a registered caregiver or healthcare provider to establish a secure link.",
+              "Add a caregiver or doctor to allow them to monitor your medication logs and receive hardware alerts.",
               style: TextStyle(color: Colors.black54, fontSize: 14),
             ),
-            const SizedBox(height: 30),
+            const SizedBox(height: 35),
 
             Container(
               padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
                 color: Colors.white,
-                borderRadius: BorderRadius.circular(15),
-                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 15)],
               ),
               child: Column(
                 children: [
@@ -193,13 +203,13 @@ class _PatientRequestState extends State<PatientRequest> {
                     controller: _targetEmailController,
                     keyboardType: TextInputType.emailAddress,
                     decoration: InputDecoration(
-                      hintText: "Enter Provider's Email",
-                      prefixIcon: const Icon(Icons.alternate_email, color: Color(0xFF1A3B70)),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                      labelText: "Provider Email",
+                      hintText: "Enter email address",
+                      prefixIcon: const Icon(Icons.email_outlined, color: Color(0xFF1A3B70)),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                   ),
                   const SizedBox(height: 25),
-                  
                   SizedBox(
                     width: double.infinity,
                     height: 55,
@@ -207,11 +217,11 @@ class _PatientRequestState extends State<PatientRequest> {
                       onPressed: isLoading ? null : _findAndRequest,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFF1A3B70),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
                       child: isLoading 
                         ? const CircularProgressIndicator(color: Colors.white)
-                        : const Text("Send Connection Request", 
+                        : const Text("Send Link Request", 
                             style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
                     ),
                   ),

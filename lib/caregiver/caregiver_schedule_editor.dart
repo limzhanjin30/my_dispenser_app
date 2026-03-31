@@ -19,31 +19,29 @@ class CaregiverScheduleEditor extends StatefulWidget {
 }
 
 class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
-  final TextEditingController _nameController = TextEditingController();
-  final TextEditingController _pillCountController = TextEditingController();
-  final TextEditingController _dayIntervalController = TextEditingController(text: "2");
+  final TextEditingController _medDetailsController = TextEditingController();
 
   String _selectedMealCondition = "After Meal";
   String _selectedFrequency = "Everyday";
   DateTime _pickerTime = DateTime.now();
   
-  // DATE VARIABLES
   DateTime _startDate = DateTime.now();
-  DateTime _endDate = DateTime.now().add(const Duration(days: 7)); // Default: 1 week duration
+  DateTime _endDate = DateTime.now().add(const Duration(days: 7));
 
   List<String> _currentMedTimes = [];
   int _selectedIndex = 0; 
   String? _currentTargetEmail;
+  String? _currentTargetMachineId; 
   bool _isLoading = false;
 
-  List<Map<String, dynamic>> _localSlots = [];
+  List<Map<String, dynamic>> _machineSlots = []; 
 
   @override
   void initState() {
     super.initState();
     _currentTargetEmail = widget.initialTargetEmail;
     if (_currentTargetEmail != null) {
-      _loadPatientSchedule(_currentTargetEmail!);
+      _fetchPatientMachineInfo(_currentTargetEmail!);
     }
   }
 
@@ -54,361 +52,271 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
         .snapshots();
   }
 
-  Future<void> _loadPatientSchedule(String pEmail) async {
-    setState(() => _isLoading = true);
-    String cleanEmail = pEmail.trim().toLowerCase();
-
+  Future<void> _fetchPatientMachineInfo(String pEmail) async {
+    if (!mounted) return;
+    setState(() {
+      _isLoading = true;
+      _currentTargetMachineId = null; 
+    });
+    
     try {
-      var doc = await FirebaseFirestore.instance.collection('schedules').doc(cleanEmail).get();
+      var userDoc = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: pEmail.trim().toLowerCase())
+          .limit(1)
+          .get();
 
-      if (doc.exists && doc.data()!.containsKey('slots')) {
-        setState(() {
-          _localSlots = List<Map<String, dynamic>>.from(doc.data()!['slots']);
-        });
+      if (userDoc.docs.isNotEmpty) {
+        String? machineId = userDoc.docs.first.get('linkedMachineId'); 
+        if (machineId != null && machineId.isNotEmpty) {
+          _currentTargetMachineId = machineId;
+          _listenToMachineStatus();
+        } else {
+          if (mounted) setState(() => _isLoading = false);
+        }
       } else {
-        setState(() {
-          _localSlots = List.generate(5, (index) => {
-            "slot": (index + 1).toString(),
-            "name": "Empty Slot ${index + 1}",
-            "pills": "0",
-            "times": [],
-            "mealCondition": "After Meal",
-            "frequency": "Everyday",
-            "startDate": DateFormat('yyyy-MM-dd').format(DateTime.now()),
-            "endDate": DateFormat('yyyy-MM-dd').format(DateTime.now().add(const Duration(days: 7))), // NEW
-            "isDone": false,
-          });
-        });
+        if (mounted) setState(() => _isLoading = false);
       }
-      _loadSlotIntoForm(0); 
     } catch (e) {
-      debugPrint("Error loading schedule: $e");
-    } finally {
       if (mounted) setState(() => _isLoading = false);
     }
   }
 
+  void _listenToMachineStatus() {
+    if (_currentTargetMachineId == null) return;
+
+    FirebaseFirestore.instance
+        .collection('machines')
+        .doc(_currentTargetMachineId)
+        .snapshots()
+        .listen((snap) {
+      if (!mounted) return;
+      if (snap.exists) {
+        setState(() {
+          _machineSlots = List<Map<String, dynamic>>.from(snap.data()!['slots']);
+          _isLoading = false; 
+        });
+        _loadSlotIntoForm(_selectedIndex);
+      } else {
+        _initializeNewMachine();
+      }
+    }, onError: (err) {
+      if (mounted) setState(() => _isLoading = false);
+    });
+  }
+
+  void _initializeNewMachine() async {
+    List<Map<String, dynamic>> initialSlots = List.generate(10, (index) => {
+      "slot": index + 1, "status": "Empty", "patientEmail": "", "medDetails": "",
+      "times": [], "startDate": "", "endDate": "", "frequency": "Everyday",
+      "mealCondition": "After Meal", "isLocked": false, "isDone": false,
+    });
+    try {
+      await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).set({'slots': initialSlots});
+    } catch (e) {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  // --- LOGIC: PRECISION AUTO-CLEAR ON TARGETED SLOT ---
   void _loadSlotIntoForm(int index) {
-    if (_localSlots.isEmpty) return;
-    var med = _localSlots[index];
+    if (_machineSlots.isEmpty || index >= _machineSlots.length) return;
+    var slot = _machineSlots[index];
+
+    bool isMine = slot['patientEmail'] == _currentTargetEmail?.trim().toLowerCase();
+    bool isOccupied = slot['status'] == "Occupied";
+
+    // AUTO-CLEAR LOGIC: If last medicine is taken AND date has ended for THIS slot
+    if (isOccupied && slot['endDate'] != "") {
+      DateTime now = DateTime.now();
+      DateTime todayMidnight = DateTime(now.year, now.month, now.day);
+      DateTime end = DateTime.parse(slot['endDate']);
+      
+      bool isCourseFinished = todayMidnight.isAtSameMomentAs(end) || todayMidnight.isAfter(end);
+      if (isCourseFinished && slot['isDone'] == true) {
+        _clearSlot(index: index, silent: true); 
+        return;
+      }
+    }
 
     setState(() {
       _selectedIndex = index;
-      _nameController.text = med['name'].contains("Empty Slot") ? "" : med['name'];
-      _pillCountController.text = med['pills'] ?? "0";
-      _selectedMealCondition = med['mealCondition'] ?? "After Meal";
-      _selectedFrequency = med['frequency'] ?? "Everyday";
-      _currentMedTimes = List<String>.from(med['times'] ?? []);
-      
-      _startDate = med['startDate'] != null ? DateTime.parse(med['startDate']) : DateTime.now();
-      _endDate = med['endDate'] != null ? DateTime.parse(med['endDate']) : DateTime.now().add(const Duration(days: 7));
+      if (isMine || !isOccupied) {
+        _medDetailsController.text = slot['medDetails'] ?? "";
+        _selectedMealCondition = slot['mealCondition'] ?? "After Meal";
+        _currentMedTimes = List<String>.from(slot['times'] ?? []);
+        _startDate = (slot['startDate'] != null && slot['startDate'] != "") ? DateTime.parse(slot['startDate']) : DateTime.now();
+        _endDate = (slot['endDate'] != null && slot['endDate'] != "") ? DateTime.parse(slot['endDate']) : DateTime.now().add(const Duration(days: 7));
+      } else {
+        _medDetailsController.text = "LOCKED: Occupied by other patient";
+      }
     });
   }
 
-  void _clearCurrentSlot() {
-    setState(() {
-      _nameController.clear();
-      _pillCountController.text = "0";
-      _selectedMealCondition = "After Meal";
-      _selectedFrequency = "Everyday";
-      _currentMedTimes = [];
-      _startDate = DateTime.now();
-      _endDate = DateTime.now().add(const Duration(days: 7));
-    });
-  }
+  Future<void> _clearSlot({int? index, bool silent = false}) async {
+    if (_currentTargetMachineId == null) return;
+    int targetIdx = index ?? _selectedIndex;
+    if (!silent) setState(() => _isLoading = true);
 
-  Future<void> _saveChanges() async {
-    if (_currentTargetEmail == null) return;
-    
-    // VALIDATION: Ensure End Date is after Start Date
-    if (_endDate.isBefore(_startDate)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Error: End Date cannot be before Start Date"), backgroundColor: Colors.red),
-      );
-      return;
-    }
-
-    setState(() => _isLoading = true);
-    String cleanEmail = _currentTargetEmail!.trim().toLowerCase();
-
-    String finalFrequency = _selectedFrequency == "Every X Days"
-        ? "Every ${_dayIntervalController.text} Days"
-        : _selectedFrequency;
-
-    _localSlots[_selectedIndex] = {
-      "slot": (_selectedIndex + 1).toString(),
-      "name": _nameController.text.isEmpty ? "Empty Slot ${_selectedIndex + 1}" : _nameController.text,
-      "pills": _pillCountController.text,
-      "times": _currentMedTimes,
-      "mealCondition": _selectedMealCondition,
-      "frequency": finalFrequency,
-      "startDate": DateFormat('yyyy-MM-dd').format(_startDate),
-      "endDate": DateFormat('yyyy-MM-dd').format(_endDate), // SAVE END DATE
-      "isDone": false,
+    _machineSlots[targetIdx] = {
+      "slot": targetIdx + 1, "status": "Empty", "patientEmail": "", "medDetails": "",
+      "times": [], "mealCondition": "After Meal", "frequency": "Everyday",
+      "startDate": "", "endDate": "", "isLocked": false, "isDone": false,
+      "adherenceStatus": "Upcoming", "lastTakenDate": "", "lastTakenTime": "",
     };
 
     try {
-      await FirebaseFirestore.instance.collection('schedules').doc(cleanEmail).set({
-        "lastUpdated": FieldValue.serverTimestamp(),
-        "updatedBy": widget.userEmail,
-        "slots": _localSlots,
+      await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).update({
+        "slots": _machineSlots,
+        "lastUpdatedBy": widget.userEmail,
+        "syncTime": FieldValue.serverTimestamp(),
       });
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Cloud Sync Complete. Hardware Updated."), backgroundColor: Colors.teal),
-        );
-      }
+      if (!silent) _showMsg("Slot ${targetIdx + 1} has been reset.", Colors.blueGrey);
     } catch (e) {
-      debugPrint("Save error: $e");
+      if (!silent) _showMsg("Error: $e", Colors.red);
+    } finally {
+      if (!silent && mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _saveChanges() async {
+    if (_currentTargetMachineId == null || _currentTargetEmail == null) return;
+    if (_machineSlots[_selectedIndex]['status'] == "Occupied" && _machineSlots[_selectedIndex]['patientEmail'] != _currentTargetEmail) {
+      _showMsg("Access Denied.", Colors.red); return;
+    }
+
+    setState(() => _isLoading = true);
+
+    _machineSlots[_selectedIndex] = {
+      "slot": _selectedIndex + 1,
+      "status": "Occupied",
+      "patientEmail": _currentTargetEmail!.trim().toLowerCase(),
+      "medDetails": _medDetailsController.text,
+      "times": _currentMedTimes,
+      "mealCondition": _selectedMealCondition,
+      "frequency": "Everyday",
+      "startDate": DateFormat('yyyy-MM-dd').format(_startDate),
+      "endDate": DateFormat('yyyy-MM-dd').format(_endDate),
+      "isLocked": true, "isDone": false,
+      "adherenceStatus": "Upcoming", "lastTakenDate": "", "lastTakenTime": "",
+    };
+
+    try {
+      await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).update({
+        "slots": _machineSlots,
+        "lastUpdatedBy": widget.userEmail,
+        "syncTime": FieldValue.serverTimestamp(),
+      });
+      _showMsg("Slot ${_selectedIndex + 1} Locked.", Colors.teal);
+    } catch (e) {
+      _showMsg("Error: $e", Colors.red);
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
   }
 
-  // DATE PICKERS
-  Future<void> _selectDate(BuildContext context, bool isStart) async {
-    final DateTime? picked = await showDatePicker(
-      context: context,
-      initialDate: isStart ? _startDate : _endDate,
-      firstDate: DateTime.now().subtract(const Duration(days: 365)), 
-      lastDate: DateTime(2030),
-    );
-    if (picked != null) {
-      setState(() {
-        if (isStart) {
-          _startDate = picked;
-          // Auto-adjust end date if it becomes invalid
-          if (_endDate.isBefore(_startDate)) {
-            _endDate = _startDate.add(const Duration(days: 1));
-          }
-        } else {
-          _endDate = picked;
-        }
-      });
-    }
-  }
-
-  void _addTimeSlot() {
-    String period = _pickerTime.hour >= 12 ? "PM" : "AM";
-    int hour = _pickerTime.hour > 12 ? _pickerTime.hour - 12 : (_pickerTime.hour == 0 ? 12 : _pickerTime.hour);
-    String formatted = "$hour:${_pickerTime.minute.toString().padLeft(2, '0')} $period";
-
-    if (!_currentMedTimes.contains(formatted)) {
-      setState(() {
-        _currentMedTimes.add(formatted);
-        _currentMedTimes.sort();
-      });
-    }
-  }
+  void _showMsg(String m, Color c) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: c));
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFF5F9FF),
-      appBar: AppBar(
-        title: const Text("Dispenser Configurator", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)),
-        backgroundColor: Colors.white, centerTitle: true, elevation: 0.5,
-      ),
+      appBar: AppBar(title: const Text("Schedule Editor", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)), backgroundColor: Colors.white, centerTitle: true, elevation: 0.5),
       body: StreamBuilder<QuerySnapshot>(
         stream: _getLinkedPatientsStream(),
         builder: (context, snapshot) {
-          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return _buildEmptyState();
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return _buildEmptyState("No linked patients.");
+          var pts = snapshot.data!.docs;
 
-          var patients = snapshot.data!.docs;
-          
-          if (_currentTargetEmail == null && patients.isNotEmpty) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (_currentTargetEmail == null) {
-                String firstEmail = patients.first.get('patientEmail');
-                setState(() => _currentTargetEmail = firstEmail);
-                _loadPatientSchedule(firstEmail);
-              }
-            });
-            return const Center(child: CircularProgressIndicator());
-          }
-
-          return _isLoading 
-            ? const Center(child: CircularProgressIndicator()) 
-            : SingleChildScrollView(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text("1. Select Patient", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
-                    const SizedBox(height: 10),
-                    _buildPatientDropdown(patients),
-
-                    const SizedBox(height: 25),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text("2. Physical Slot (1-5)", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
-                        TextButton.icon(onPressed: _clearCurrentSlot, icon: const Icon(Icons.refresh, size: 16, color: Colors.red), label: const Text("Clear Slot", style: TextStyle(color: Colors.red, fontSize: 12))),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    _buildSlotTabs(),
-
-                    const SizedBox(height: 25),
-                    _buildInputField("Medicine Name", _nameController, Icons.medication),
-                    const SizedBox(height: 15),
-                    _buildInputField("Pills per dispensing", _pillCountController, Icons.pin, isNum: true),
-
-                    // --- DURATION SECTION ---
-                    const SizedBox(height: 25),
-                    const Text("Prescription Duration:", style: TextStyle(fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 10),
-                    Row(
-                      children: [
-                        Expanded(child: _buildDateTile("Start Date", _startDate, () => _selectDate(context, true))),
-                        const SizedBox(width: 10),
-                        Expanded(child: _buildDateTile("Repeat Until", _endDate, () => _selectDate(context, false))),
-                      ],
-                    ),
-
-                    const SizedBox(height: 25),
-                    const Text("Meal Instruction", style: TextStyle(fontWeight: FontWeight.bold)),
-                    Row(children: [_mealRadio("Before Meal"), _mealRadio("After Meal")]),
-
-                    const SizedBox(height: 25),
-                    const Text("Repeat Frequency", style: TextStyle(fontWeight: FontWeight.bold)),
-                    _buildFrequencyDropdown(),
-                    if (_selectedFrequency == "Every X Days") 
-                      Padding(padding: const EdgeInsets.only(top: 10), child: _buildInputField("Interval (Days)", _dayIntervalController, Icons.calendar_today, isNum: true)),
-
-                    const SizedBox(height: 25),
-                    const Text("Dispense Timings", style: TextStyle(fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 10),
-                    _buildTimeChips(),
-                    _buildTimePickerSection(),
-
-                    const SizedBox(height: 40),
-                    SizedBox(
-                      width: double.infinity, height: 55,
-                      child: ElevatedButton(
-                        onPressed: _saveChanges,
-                        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A3B70), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
-                        child: Text("Sync Slot ${_selectedIndex + 1} to Cloud", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                  ],
-                ),
-              );
+          return _isLoading ? const Center(child: CircularProgressIndicator()) : SingleChildScrollView(
+            padding: const EdgeInsets.all(25),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text("1. Select Patient", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
+              const SizedBox(height: 10),
+              _buildPatientDropdown(pts),
+              const SizedBox(height: 25),
+              if (_currentTargetEmail == null) _buildPromptState("Please select a patient to manage bins.")
+              else if (_currentTargetMachineId == null) _buildNoMachineWarning()
+              else ...[
+                _buildMachineHeader(),
+                const SizedBox(height: 30),
+                const Text("Select Hardware Slot:", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
+                const SizedBox(height: 12),
+                _buildSlotGrid(), 
+                const SizedBox(height: 35),
+                _buildConfigForm(),
+              ],
+            ]),
+          );
         },
       ),
       bottomNavigationBar: CustomBottomNavBar(currentIndex: 1, role: "Caregiver", userEmail: widget.userEmail),
     );
   }
 
-  // --- UI COMPONENTS ---
-
-  Widget _buildDateTile(String label, DateTime date, VoidCallback onTap) {
-    return InkWell(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10), border: Border.all(color: Colors.grey.shade300)),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 5),
-            Row(children: [
-              const Icon(Icons.calendar_today, size: 14, color: Color(0xFF1A3B70)),
-              const SizedBox(width: 8),
-              Text(DateFormat('MMM d, yyyy').format(date), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-            ]),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPatientDropdown(List<DocumentSnapshot> patients) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
-      decoration: BoxDecoration(
-        color: Colors.white, 
-        borderRadius: BorderRadius.circular(12), 
-        border: Border.all(color: Colors.grey.shade300)
-      ),
-      child: DropdownButtonHideUnderline(
-        child: DropdownButton<String>(
-          // CRITICAL: Type must match the items
-          value: _currentTargetEmail, 
-          isExpanded: true,
-          hint: const Text("Select a patient"),
-          items: patients.map((p) {
-            // Cast the value explicitly to String
-            String email = p.get('patientEmail').toString(); 
-            return DropdownMenuItem<String>(
-              value: email, 
-              child: Text(email, style: const TextStyle(fontSize: 14)),
-            );
-          }).toList(),
-          onChanged: (val) { 
-            setState(() => _currentTargetEmail = val);
-            if (val != null) _loadPatientSchedule(val);
-          },
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSlotTabs() {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: List.generate(5, (index) {
-        bool isSelected = _selectedIndex == index;
-        return GestureDetector(
-          onTap: () => _loadSlotIntoForm(index),
-          child: Container(
-            width: 60, height: 50,
-            decoration: BoxDecoration(color: isSelected ? const Color(0xFF1A3B70) : Colors.white, borderRadius: BorderRadius.circular(10), border: Border.all(color: const Color(0xFF1A3B70))),
-            child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-              Text("Slot", style: TextStyle(color: isSelected ? Colors.white70 : Colors.grey, fontSize: 10)),
-              Text("${index + 1}", style: TextStyle(color: isSelected ? Colors.white : const Color(0xFF1A3B70), fontWeight: FontWeight.bold, fontSize: 16)),
-            ]),
-          ),
-        );
-      }),
-    );
-  }
-
-  Widget _buildTimeChips() {
-    return Wrap(spacing: 8, children: _currentMedTimes.map((time) => Chip(label: Text(time), deleteIcon: const Icon(Icons.cancel, size: 16), onDeleted: () => setState(() => _currentMedTimes.remove(time)), backgroundColor: Colors.blue.withOpacity(0.1))).toList());
-  }
-
-  Widget _buildTimePickerSection() {
-    return Row(children: [
-      Expanded(child: SizedBox(height: 100, child: CupertinoDatePicker(mode: CupertinoDatePickerMode.time, onDateTimeChanged: (t) => _pickerTime = t))),
-      IconButton.filled(onPressed: _addTimeSlot, icon: const Icon(Icons.add_alarm)),
+  Widget _buildConfigForm() {
+    var slot = _machineSlots[_selectedIndex];
+    bool isMine = slot['patientEmail'] == _currentTargetEmail?.trim().toLowerCase();
+    bool isLockedOther = slot['status'] == "Occupied" && !isMine;
+    
+    return Column(children: [
+      AbsorbPointer(absorbing: isLockedOther, child: Opacity(opacity: isLockedOther ? 0.4 : 1.0, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        _buildInputField("Physical Pill Name", _medDetailsController, Icons.medication),
+        const SizedBox(height: 20),
+        Row(children: [
+          Expanded(child: _buildDateTile("Starts On", _startDate, () => _selectDate(context, true))), 
+          const SizedBox(width: 12), 
+          Expanded(child: _buildDateTile("Final Date", _endDate, () => _selectDate(context, false)))
+        ]),
+        const SizedBox(height: 30),
+        const Text("Daily Alarms", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF1A3B70))),
+        const SizedBox(height: 12),
+        _buildTimeChips(),
+        _buildTimePickerSection(),
+      ]))),
+      const SizedBox(height: 40),
+      Row(children: [
+        if (slot['status'] == "Occupied" && isMine) Expanded(child: OutlinedButton(onPressed: () => _clearSlot(), style: OutlinedButton.styleFrom(foregroundColor: Colors.red, side: const BorderSide(color: Colors.red), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)), padding: const EdgeInsets.symmetric(vertical: 16)), child: const Text("Clear Slot", style: TextStyle(fontWeight: FontWeight.bold)))),
+        if (slot['status'] == "Occupied" && isMine) const SizedBox(width: 15),
+        Expanded(flex: 2, child: ElevatedButton(onPressed: isLockedOther ? null : _saveChanges, style: ElevatedButton.styleFrom(backgroundColor: isLockedOther ? Colors.grey : const Color(0xFF1A3B70), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)), padding: const EdgeInsets.symmetric(vertical: 16)), child: Text(isLockedOther ? "SLOT OCCUPIED" : "Sync & Lock Slot ${_selectedIndex + 1}", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
+      ]),
     ]);
   }
 
-  Widget _buildFrequencyDropdown() {
-    return Container(
-      margin: const EdgeInsets.only(top: 10), padding: const EdgeInsets.symmetric(horizontal: 12),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10), border: Border.all(color: Colors.grey.shade200)),
+  // --- UI COMPONENTS ---
+  Widget _buildPatientDropdown(List<DocumentSnapshot> pts) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 15), 
+    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.grey.shade300)), 
+    child: DropdownButtonHideUnderline(
       child: DropdownButton<String>(
-        value: _selectedFrequency.contains("Every") && !_selectedFrequency.startsWith("Everyday") ? "Every X Days" : _selectedFrequency,
-        isExpanded: true, underline: const SizedBox(),
-        items: ["Everyday", "No Repeat", "Every X Days"].map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(),
-        onChanged: (v) => setState(() => _selectedFrequency = v!),
-      ),
-    );
+        value: _currentTargetEmail, 
+        isExpanded: true,
+        hint: const Text("Select Patient", style: TextStyle(color: Colors.grey, fontSize: 14)), // Hint inside box
+        items: pts.map((p) => DropdownMenuItem<String>(value: p.get('patientEmail').toString(), child: Text(p.get('patientEmail')))).toList(), 
+        onChanged: (v) { if (v != null) { setState(() => _currentTargetEmail = v); _fetchPatientMachineInfo(v); } }
+      )
+    )
+  );
+
+  Widget _buildInputField(String l, TextEditingController c, IconData i) => TextField(controller: c, decoration: InputDecoration(labelText: l, prefixIcon: Icon(i), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), filled: true, fillColor: Colors.white));
+  Widget _buildDateTile(String l, DateTime d, VoidCallback t) => InkWell(onTap: t, child: Container(padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10), border: Border.all(color: Colors.grey.shade300)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(l, style: const TextStyle(fontSize: 10, color: Colors.grey)), Text(DateFormat('MMM d').format(d), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))])));
+  
+  // --- STRICT DATE VALIDATION ---
+  Future<void> _selectDate(BuildContext ctx, bool isS) async { 
+    final DateTime? p = await showDatePicker(
+      context: ctx, 
+      initialDate: isS ? _startDate : _endDate, 
+      firstDate: isS ? DateTime.now().subtract(const Duration(days: 365)) : _startDate, // FIXED: End date cannot be before start date
+      lastDate: DateTime(2030)
+    ); 
+    if (p != null) setState(() { if (isS) { _startDate = p; if (_endDate.isBefore(_startDate)) _endDate = _startDate; } else { _endDate = p; } }); 
   }
 
-  Widget _buildInputField(String label, TextEditingController controller, IconData icon, {bool isNum = false}) {
-    return TextField(controller: controller, keyboardType: isNum ? TextInputType.number : TextInputType.text, decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), filled: true, fillColor: Colors.white));
-  }
-
-  Widget _mealRadio(String val) {
-    return Expanded(child: RadioListTile(title: Text(val, style: const TextStyle(fontSize: 12)), value: val, groupValue: _selectedMealCondition, onChanged: (v) => setState(() => _selectedMealCondition = v!)));
-  }
-
-  Widget _buildEmptyState() {
-    return const Center(child: Text("No linked patients found. Link a patient first."));
-  }
+  Widget _buildTimeChips() => Wrap(spacing: 8, children: _currentMedTimes.map((t) => Chip(label: Text(t), deleteIcon: const Icon(Icons.cancel, size: 16), onDeleted: () => setState(() => _currentMedTimes.remove(t)))).toList());
+  Widget _buildTimePickerSection() => Row(children: [Expanded(child: SizedBox(height: 100, child: CupertinoDatePicker(mode: CupertinoDatePickerMode.time, onDateTimeChanged: (t) => _pickerTime = t))), IconButton.filled(onPressed: () { String f = DateFormat("hh:mm a").format(_pickerTime); if (!_currentMedTimes.contains(f)) setState(() { _currentMedTimes.add(f); _currentMedTimes.sort(); }); }, icon: const Icon(Icons.add_alarm))]);
+  Widget _buildSlotGrid() => GridView.builder(shrinkWrap: true, physics: const NeverScrollableScrollPhysics(), gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 5, crossAxisSpacing: 10, mainAxisSpacing: 10), itemCount: 10, itemBuilder: (c, i) { bool s = _selectedIndex == i; var sl = _machineSlots.length > i ? _machineSlots[i] : null; bool occ = sl?['status'] == "Occupied"; bool m = sl?['patientEmail'] == _currentTargetEmail; return GestureDetector(onTap: () => _loadSlotIntoForm(i), child: Container(decoration: BoxDecoration(color: s ? const Color(0xFF1A3B70) : (occ ? (m ? Colors.green.shade100 : Colors.red.shade100) : Colors.white), borderRadius: BorderRadius.circular(10), border: Border.all(color: s ? Colors.blue : Colors.grey.shade300)), child: Center(child: Text("${i + 1}", style: TextStyle(fontWeight: FontWeight.bold, color: s ? Colors.white : Colors.black))))); });
+  Widget _buildMachineHeader() => Container(padding: const EdgeInsets.all(15), decoration: BoxDecoration(color: Colors.blue.withOpacity(0.1), borderRadius: BorderRadius.circular(12)), child: Row(children: [const Icon(Icons.settings_remote, size: 18), const SizedBox(width: 10), Text("Machine ID: ${_currentTargetMachineId}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))]));
+  Widget _buildNoMachineWarning() => const Center(child: Text("Hardware not linked."));
+  Widget _buildPromptState(String m) => Center(child: Padding(padding: const EdgeInsets.only(top: 50), child: Text(m, style: const TextStyle(color: Colors.grey))));
+  Widget _buildEmptyState(String m) => Center(child: Text(m));
 }

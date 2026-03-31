@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class HealthcareAccept extends StatefulWidget {
   final String userEmail;
@@ -11,27 +11,28 @@ class HealthcareAccept extends StatefulWidget {
 
 class _HealthcareAcceptState extends State<HealthcareAccept> {
   
-  // --- NEW: LOGIC TO HANDLE FIREBASE ACTIONS ---
+  // --- LOGIC: PROCESS CLINICAL ACCESS REQUESTS ---
   Future<void> _handleAction(String requestId, Map<String, dynamic> requestData, bool isAccepted) async {
     try {
       if (isAccepted) {
         // 1. Create a permanent connection in the 'connections' collection
-        // We use 'caregiverEmail' as the common key for both Caregivers and Healthcare Providers
+        // FIXED: Using 'healthcareEmail' key so clinical dashboard can find the patient
         await FirebaseFirestore.instance.collection('connections').add({
-          "caregiverEmail": widget.userEmail.trim().toLowerCase(),
+          "healthcareEmail": widget.userEmail.trim().toLowerCase(),
           "patientEmail": requestData['senderEmail']!.trim().toLowerCase(),
           "connectedAt": FieldValue.serverTimestamp(),
         });
       }
 
-      // 2. Delete the request from the 'requests' collection
+      // 2. Delete the request from the 'requests' collection to clear the inbox
       await FirebaseFirestore.instance.collection('requests').doc(requestId).delete();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(isAccepted ? "Patient linked to your clinical panel!" : "Request declined"),
+            content: Text(isAccepted ? "Patient added to your clinical panel!" : "Request declined"),
             backgroundColor: isAccepted ? Colors.teal : Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
           ),
         );
       }
@@ -42,7 +43,7 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
 
   @override
   Widget build(BuildContext context) {
-    // --- NEW: REAL-TIME STREAM OF INCOMING REQUESTS ---
+    // REAL-TIME STREAM: Show clinical requests sent to this Doctor
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance
           .collection('requests')
@@ -50,7 +51,7 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
           .snapshots(),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+          return const Scaffold(body: Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70))));
         }
 
         if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
@@ -67,17 +68,17 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
           backgroundColor: const Color(0xFFF5F9FF),
           appBar: _buildAppBar(),
           body: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(20, 30, 20, 20),
+            padding: const EdgeInsets.all(25),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  "Connection Requests",
+                  "Pending Authorizations",
                   style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  "Patients listed below want you to manage their medication dispenser.",
+                  "Patients listed below have invited you to monitor their dispenser activity professionally.",
                   style: TextStyle(color: Colors.black54, fontSize: 14),
                 ),
                 const SizedBox(height: 25),
@@ -105,8 +106,8 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
         icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
         onPressed: () => Navigator.pop(context),
       ),
-      title: const Text("Healthcare Access Requests",
-          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 18)),
+      title: const Text("Access Inbox",
+          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)),
       backgroundColor: Colors.white,
       elevation: 0.5,
       centerTitle: true,
@@ -116,7 +117,7 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
   Widget _buildRequestCard(String docId, Map<String, dynamic> request) {
     return Container(
       margin: const EdgeInsets.only(bottom: 15),
-      padding: const EdgeInsets.all(18),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(15),
@@ -126,10 +127,10 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
         children: [
           Row(
             children: [
-              CircleAvatar(
-                backgroundColor: Colors.grey[100],
-                radius: 25,
-                child: const Icon(Icons.person, color: Color(0xFF1A3B70), size: 28),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: const BoxDecoration(color: Color(0xFFE0F2F1), shape: BoxShape.circle),
+                child: const Icon(Icons.person_add_alt_1_outlined, color: Colors.teal, size: 24),
               ),
               const SizedBox(width: 15),
               Expanded(
@@ -137,21 +138,16 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      request['senderRole'] ?? "Patient",
-                      style: const TextStyle(
+                      request['senderName'] ?? "Patient",
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17),
+                    ),
+                    const Text(
+                      "CLINICAL OVERSIGHT REQUEST",
+                      style: TextStyle(
                         fontWeight: FontWeight.bold, 
-                        fontSize: 12, 
+                        fontSize: 10, 
                         color: Colors.blue,
                         letterSpacing: 1.1
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      "${request['requestText']}",
-                      style: const TextStyle(
-                        fontSize: 15, 
-                        color: Colors.black87,
-                        height: 1.3
                       ),
                     ),
                   ],
@@ -159,7 +155,17 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
               ),
             ],
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 15),
+          const Divider(),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              "${request['requestText']}",
+              style: const TextStyle(fontSize: 14, color: Colors.black87, height: 1.4),
+            ),
+          ),
+          const SizedBox(height: 25),
           Row(
             children: [
               Expanded(
@@ -167,10 +173,10 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
                   onPressed: () => _handleAction(docId, request, true),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.teal,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                   ),
-                  child: const Text("Accept", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  child: const Text("Accept Access", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                 ),
               ),
               const SizedBox(width: 12),
@@ -178,11 +184,12 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
                 child: OutlinedButton(
                   onPressed: () => _handleAction(docId, request, false),
                   style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.blueGrey,
                     side: const BorderSide(color: Colors.blueGrey),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                   ),
-                  child: const Text("Decline", style: TextStyle(color: Colors.blueGrey, fontWeight: FontWeight.bold)),
+                  child: const Text("Decline", style: TextStyle(fontWeight: FontWeight.bold)),
                 ),
               ),
             ],
@@ -197,12 +204,10 @@ class _HealthcareAcceptState extends State<HealthcareAccept> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const SizedBox(height: 100),
-          Icon(Icons.mark_email_read_outlined, size: 80, color: Colors.grey[300]),
+          Icon(Icons.mark_email_read_outlined, size: 80, color: Colors.grey[200]),
           const SizedBox(height: 15),
-          const Text("No pending requests", style: TextStyle(color: Colors.grey, fontSize: 16)),
-          const SizedBox(height: 5),
-          const Text("Patients you link with will appear here.", style: TextStyle(color: Colors.grey, fontSize: 13)),
+          const Text("No pending clinical requests", style: TextStyle(color: Colors.grey, fontSize: 16, fontWeight: FontWeight.w500)),
+          const Text("Patients you verify will appear here.", style: TextStyle(color: Colors.grey, fontSize: 13)),
         ],
       ),
     );
