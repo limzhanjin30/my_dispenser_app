@@ -3,7 +3,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 import 'healthcare_dashboard.dart';
 import '../custom_bottom_nav.dart';
-import '../modals/user_modal.dart'; 
 
 class HealthcareAdherence extends StatefulWidget {
   final String userEmail;
@@ -14,93 +13,13 @@ class HealthcareAdherence extends StatefulWidget {
 }
 
 class _HealthcareAdherenceState extends State<HealthcareAdherence> {
-  String fullName = "Healthcare Provider";
   String? _selectedPatientEmail;
-  String? _linkedMachineId;
-  DateTime _currentWeekStart = DateTime.now().subtract(Duration(days: DateTime.now().weekday - 1));
-  bool _isDataLoading = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _fetchProviderName();
-  }
-
-  void _fetchProviderName() {
-    final user = registeredUsers.firstWhere(
-      (u) => u['email']?.trim().toLowerCase() == widget.userEmail.trim().toLowerCase(),
-      orElse: () => {},
-    );
-    if (user.isNotEmpty) {
-      setState(() => fullName = user['name'] ?? "Healthcare Provider");
-    }
-  }
-
-  // --- DATABASE: LOOKUP PATIENT MACHINE ---
-  Future<void> _fetchMachineId(String pEmail) async {
-    setState(() => _isDataLoading = true);
-    try {
-      var userSnap = await FirebaseFirestore.instance
-          .collection('users')
-          .where('email', isEqualTo: pEmail.trim().toLowerCase())
-          .limit(1)
-          .get();
-
-      if (userSnap.docs.isNotEmpty) {
-        setState(() {
-          _linkedMachineId = userSnap.docs.first.get('linkedMachineId');
-          _isDataLoading = false;
-        });
-      }
-    } catch (e) {
-      debugPrint("Adherence Fetch Error: $e");
-      setState(() => _isDataLoading = false);
-    }
-  }
-
-  // --- LOGIC: ADHERENCE STATUS CALCULATION ---
-  String _calculateStatus(Map<String, dynamic> slot, DateTime date, String timeStr) {
-    DateTime now = DateTime.now();
-    DateTime checkDay = DateTime(date.year, date.month, date.day);
-    String checkDayStr = DateFormat('yyyy-MM-dd').format(checkDay);
-
-    if (slot['startDate'] == null || slot['endDate'] == null || slot['startDate'] == "") return "Inactive";
-    DateTime start = DateTime.parse(slot['startDate']);
-    DateTime end = DateTime.parse(slot['endDate']);
-    
-    if (checkDay.isBefore(DateTime(start.year, start.month, start.day)) || 
-        checkDay.isAfter(DateTime(end.year, end.month, end.day))) return "Inactive";
-
-    if (slot['lastTakenDate'] == checkDayStr) {
-      String adj = slot['adherenceStatus'] ?? "Taken"; 
-      return "$adj at ${slot['lastTakenTime'] ?? 'Unknown'}";
-    }
-
-    try {
-      DateTime parsedTime = DateFormat("hh:mm a").parse(timeStr);
-      DateTime fullScheduledTime = DateTime(date.year, date.month, date.day, parsedTime.hour, parsedTime.minute);
-      DateTime graceLimit = fullScheduledTime.add(const Duration(minutes: 30));
-
-      if (now.isAfter(graceLimit)) {
-        if (slot['status'] == "Finished" && checkDay.isAfter(end)) return "Inactive";
-        return "Missed";
-      }
-    } catch (e) {
-      return "Upcoming";
-    }
-    return "Upcoming";
-  }
-
-  Color _getStatusColor(String status) {
-    if (status.contains("Late")) return Colors.orange;
-    if (status.contains("Taken")) return Colors.green;
-    if (status == "Missed") return Colors.redAccent;
-    return Colors.blueGrey;
-  }
-
-  // --- UI HELPERS ---
-  void _changeWeek(int weeks) => setState(() => _currentWeekStart = _currentWeekStart.add(Duration(days: weeks * 7)));
   
+  // Logic: Force current week to start on Monday
+  DateTime _currentWeekStart = DateTime.now().subtract(Duration(days: DateTime.now().weekday - 1));
+
+  void _changeWeek(int weeks) => setState(() => _currentWeekStart = _currentWeekStart.add(Duration(days: weeks * 7)));
+
   String _getWeekRangeString() {
     DateTime end = _currentWeekStart.add(const Duration(days: 6));
     return "${DateFormat('MMM d').format(_currentWeekStart)} - ${DateFormat('MMM d, yyyy').format(end)}";
@@ -112,10 +31,10 @@ class _HealthcareAdherenceState extends State<HealthcareAdherence> {
       backgroundColor: const Color(0xFFF5F9FF),
       appBar: AppBar(
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Color(0xFF1A3B70)),
+          icon: const Icon(Icons.arrow_back_ios, color: Color(0xFF1A3B70), size: 20),
           onPressed: () => Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => HealthcareDashboard(userEmail: widget.userEmail))),
         ),
-        title: Text(fullName, style: const TextStyle(color: Color(0xFF1A3B70), fontSize: 16, fontWeight: FontWeight.bold)),
+        title: const Text("Weekly Adherence Audit", style: TextStyle(color: Colors.black, fontSize: 16, fontWeight: FontWeight.bold)),
         backgroundColor: Colors.white, elevation: 0.5, centerTitle: true,
       ),
       body: Column(
@@ -124,10 +43,8 @@ class _HealthcareAdherenceState extends State<HealthcareAdherence> {
           _buildWeekNavigator(),
           Expanded(
             child: _selectedPatientEmail == null 
-              ? _buildEmptyState("Select a patient to review adherence logs.")
-              : (_linkedMachineId == null && !_isDataLoading
-                  ? _buildEmptyState("No hardware linked to this patient.")
-                  : _buildLogsList()),
+              ? _buildEmptyState("Select a clinical patient to audit their weekly adherence history.")
+              : _buildWeeklyLogs(),
           ),
         ],
       ),
@@ -136,26 +53,26 @@ class _HealthcareAdherenceState extends State<HealthcareAdherence> {
   }
 
   Widget _buildPatientSelector() {
-    // Note: Healthcare providers view connections where they are the assigned provider
     return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance.collection('connections').where('healthcareEmail', isEqualTo: widget.userEmail.trim().toLowerCase()).snapshots(),
+      stream: FirebaseFirestore.instance
+          .collection('connections')
+          .where('healthcareEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .snapshots(),
       builder: (context, snapshot) {
         if (!snapshot.hasData) return const LinearProgressIndicator();
         var connections = snapshot.data!.docs;
         return Container(
-          padding: const EdgeInsets.all(20),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
           color: Colors.white,
           child: DropdownButtonFormField<String>(
             value: _selectedPatientEmail,
-            hint: const Text("Select Patient to Audit"),
-            decoration: InputDecoration(labelText: "Clinical Audit", border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-            items: connections.map((c) => DropdownMenuItem(value: c.get('patientEmail').toString(), child: Text(c.get('patientEmail')))).toList(),
-            onChanged: (val) {
-              if (val != null) {
-                setState(() { _selectedPatientEmail = val; _linkedMachineId = null; });
-                _fetchMachineId(val);
-              }
-            },
+            hint: const Text("Select Patient Registry"),
+            decoration: InputDecoration(labelText: "Clinical Oversight", border: OutlineInputBorder(borderRadius: BorderRadius.circular(10))),
+            items: connections.map((c) => DropdownMenuItem(
+              value: c.get('patientEmail').toString().toLowerCase().trim(), 
+              child: Text(c.get('patientEmail'))
+            )).toList(),
+            onChanged: (val) => setState(() => _selectedPatientEmail = val),
           ),
         );
       },
@@ -164,59 +81,93 @@ class _HealthcareAdherenceState extends State<HealthcareAdherence> {
 
   Widget _buildWeekNavigator() {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 20),
+      padding: const EdgeInsets.symmetric(vertical: 15, horizontal: 20),
+      color: Colors.white,
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           IconButton(icon: const Icon(Icons.chevron_left), onPressed: () => _changeWeek(-1)),
-          Text(_getWeekRangeString(), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF1A3B70))),
+          Column(children: [
+            const Text("AUDIT PERIOD", style: TextStyle(fontSize: 10, color: Color(0xFF1A3B70), fontWeight: FontWeight.bold)),
+            Text(_getWeekRangeString(), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+          ]),
           IconButton(icon: const Icon(Icons.chevron_right), onPressed: () => _changeWeek(1)),
         ],
       ),
     );
   }
 
-  Widget _buildLogsList() {
-    return StreamBuilder<DocumentSnapshot>(
-      stream: FirebaseFirestore.instance.collection('machines').doc(_linkedMachineId).snapshots(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting || _isDataLoading) return const Center(child: CircularProgressIndicator());
-        if (!snapshot.hasData || !snapshot.data!.exists) return _buildEmptyState("Hardware data unavailable.");
+  Widget _buildWeeklyLogs() {
+    String startStr = DateFormat('yyyy-MM-dd').format(_currentWeekStart);
+    String endStr = DateFormat('yyyy-MM-dd').format(_currentWeekStart.add(const Duration(days: 7)));
 
-        var slots = List.from(snapshot.data!.get('slots') ?? []);
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance.collection('adherence_logs')
+          .where('patientEmail', isEqualTo: _selectedPatientEmail!.trim().toLowerCase())
+          .where('date', isGreaterThanOrEqualTo: startStr) 
+          .where('date', isLessThan: endStr)
+          .snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) return _buildEmptyState("Error loading clinical records.");
+        if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+
+        // Group logs by their date field
+        Map<String, List<Map<String, dynamic>>> masterMap = {};
+        for (var doc in snapshot.data?.docs ?? []) {
+          var data = doc.data() as Map<String, dynamic>;
+          String recordDate = data['date'] ?? "Unknown";
+          masterMap.putIfAbsent(recordDate, () => []).add(data);
+        }
+
+        DateTime now = DateTime.now();
+        DateTime todayMidnight = DateTime(now.year, now.month, now.day);
 
         return ListView.builder(
-          padding: const EdgeInsets.symmetric(horizontal: 20),
-          itemCount: 7,
+          padding: const EdgeInsets.all(20),
+          itemCount: 7, // Fixed Mon-Sun loop
           itemBuilder: (context, dayIndex) {
             DateTime currentDay = _currentWeekStart.add(Duration(days: dayIndex));
-            List<Map<String, dynamic>> dailyDoses = [];
+            String dayStr = DateFormat('yyyy-MM-dd').format(currentDay);
             
-            for (var slot in slots) {
-              if (slot['patientEmail'] == _selectedPatientEmail?.trim().toLowerCase() && 
-                  (slot['status'] == "Occupied" || slot['status'] == "Finished")) {
-                List<String> timings = List<String>.from(slot['times'] ?? []);
-                for (var time in timings) {
-                  dailyDoses.add({"time": time, "details": slot['medDetails'], "slot": slot['slot'], "originalSlot": slot, "isFinished": slot['status'] == "Finished"});
-                }
-              }
-            }
+            List<Map<String, dynamic>> dayItems = List.from(masterMap[dayStr] ?? []);
 
-            dailyDoses.sort((a, b) => DateFormat("hh:mm a").parse(a['time']).compareTo(DateFormat("hh:mm a").parse(b['time'])));
+            // Sort individual doses chronologically
+            dayItems.sort((a, b) {
+              String tA = (a['times'] as List).isNotEmpty ? (a['times'] as List).first : "00:00 AM";
+              String tB = (b['times'] as List).isNotEmpty ? (b['times'] as List).first : "00:00 AM";
+              return tA.compareTo(tB);
+            });
 
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  child: Text(DateFormat('EEEE, MMM d').format(currentDay), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.blueGrey)),
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  child: Text(DateFormat('EEEE, MMM d').format(currentDay), 
+                    style: TextStyle(fontWeight: FontWeight.bold, color: currentDay.isAtSameMomentAs(todayMidnight) ? Colors.blue : Colors.blueGrey)),
                 ),
-                ...dailyDoses.map((dose) {
-                  String status = _calculateStatus(dose['originalSlot'], currentDay, dose['time']);
-                  if (status == "Inactive") return const SizedBox.shrink();
-                  return _buildAdherenceCard(dose, status);
+                if (dayItems.isEmpty) 
+                  const Padding(padding: EdgeInsets.only(left: 10, bottom: 10), child: Text("No clinical logs for this date.", style: TextStyle(color: Colors.grey, fontSize: 11))),
+                
+                ...dayItems.map((item) {
+                  // --- MISSED LOGIC ---
+                  String displayStatus = item['adherenceStatus'] ?? "Upcoming";
+                  String sched = (item['times'] as List).isNotEmpty ? (item['times'] as List).first : "--:--";
+                  String actual = item['takenTime'] ?? item['lastTakenTime'] ?? "";
+
+                  // Real-time audit: if Upcoming and time passed + 30 mins
+                  if (displayStatus.toLowerCase() == "upcoming" && sched != "--:--") {
+                    try {
+                      DateTime st = DateFormat("hh:mm a").parse(sched);
+                      DateTime fullSched = DateTime(currentDay.year, currentDay.month, currentDay.day, st.hour, st.minute);
+                      if (now.isAfter(fullSched.add(const Duration(minutes: 30)))) {
+                        displayStatus = "Missed";
+                      }
+                    } catch (e) {}
+                  }
+
+                  return _buildAdherenceCard(item, displayStatus, sched, actual);
                 }),
-                if (dailyDoses.isEmpty) const Text("No prescriptions for this day.", style: TextStyle(color: Colors.grey, fontSize: 11)),
                 const Divider(height: 30),
               ],
             );
@@ -226,30 +177,58 @@ class _HealthcareAdherenceState extends State<HealthcareAdherence> {
     );
   }
 
-  Widget _buildAdherenceCard(Map<String, dynamic> dose, String status) {
-    Color color = _getStatusColor(status);
-    bool isFinished = dose['isFinished'];
+  Widget _buildAdherenceCard(Map<String, dynamic> item, String displayStatus, String scheduledTime, String actualTime) {
+    String med = item['medName'] ?? item['medDetails'] ?? "Medication";
+    int bin = item['slot'] ?? 0;
+
+    Color color; IconData icon; String subText;
+
+    switch (displayStatus.toLowerCase()) {
+      case "taken":
+        color = Colors.teal; icon = Icons.check_circle;
+        subText = "Taken at $actualTime (Scheduled: $scheduledTime)";
+        break;
+      case "late":
+        color = Colors.orange; icon = Icons.warning_amber_rounded;
+        subText = "LATE Intake at $actualTime (Scheduled: $scheduledTime)";
+        break;
+      case "missed":
+        color = Colors.redAccent; icon = Icons.error_outline;
+        subText = "MISSED: Scheduled for $scheduledTime";
+        break;
+      default:
+        color = Colors.blueGrey; icon = Icons.hourglass_empty;
+        subText = "Scheduled for $scheduledTime";
+    }
 
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(15),
-      decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(12), boxShadow: [BoxShadow(color: color.withOpacity(0.2), blurRadius: 8, offset: const Offset(0, 4))]),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Expanded(child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text("${dose['time']} - ${dose['details']}", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
-              Text("Slot ${dose['slot']} ${isFinished ? '• COMPLETED COURSE' : ''}", style: const TextStyle(color: Colors.white70, fontSize: 10, fontWeight: FontWeight.bold)),
-            ],
-          )),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(color: Colors.white.withOpacity(0.2), borderRadius: BorderRadius.circular(6)),
-            child: Text(status.toUpperCase(), style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 9)),
-          ),
-        ],
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 8, offset: const Offset(0, 4))]),
+      child: IntrinsicHeight(
+        child: Row(
+          children: [
+            Container(width: 6, decoration: BoxDecoration(color: color, borderRadius: const BorderRadius.only(topLeft: Radius.circular(12), bottomLeft: Radius.circular(12)))),
+            const SizedBox(width: 15),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 15), 
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(med, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                  const SizedBox(height: 4),
+                  Text("Bin $bin • $subText", style: const TextStyle(fontSize: 10, color: Colors.black54)),
+                ])
+              )
+            ),
+            Padding(
+              padding: const EdgeInsets.only(right: 15), 
+              child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                Icon(icon, color: color, size: 18),
+                const SizedBox(height: 4),
+                Text(displayStatus.toUpperCase(), style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 8)),
+              ])
+            ),
+          ],
+        ),
       ),
     );
   }

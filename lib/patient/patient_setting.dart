@@ -6,7 +6,8 @@ import 'patient_dashboard.dart';
 import 'patient_request.dart';
 import 'patient_linked.dart';
 import 'patient_accept.dart';
-import 'patient_link_machine.dart'; // --- IMPORT LINK MACHINE PAGE ---
+import 'patient_link_machine.dart';
+import 'patient_password.dart'; // The 4-digit PIN page
 
 class PatientSetting extends StatefulWidget {
   final String userEmail;
@@ -18,7 +19,7 @@ class PatientSetting extends StatefulWidget {
 
 class _PatientSettingState extends State<PatientSetting> {
   String fullName = "Patient";
-  String? linkedMachineId; // --- NEW STATE VARIABLE ---
+  String? linkedMachineId; 
   bool _isLoading = true;
 
   bool medReminders = true;
@@ -33,10 +34,8 @@ class _PatientSettingState extends State<PatientSetting> {
     _fetchFirestoreData();
   }
 
-  // --- FETCH USER DETAILS & MACHINE STATUS ---
   Future<void> _fetchFirestoreData() async {
     final String cleanEmail = widget.userEmail.trim().toLowerCase();
-
     try {
       var userSnapshot = await FirebaseFirestore.instance
           .collection('users')
@@ -49,7 +48,7 @@ class _PatientSettingState extends State<PatientSetting> {
           setState(() {
             var data = userSnapshot.docs.first.data();
             fullName = data['name'] ?? "Patient";
-            linkedMachineId = data['linkedMachineId']; // Fetch machine ID
+            linkedMachineId = data['linkedMachineId']; 
             _isLoading = false;
           });
         }
@@ -60,6 +59,17 @@ class _PatientSettingState extends State<PatientSetting> {
       debugPrint("Error fetching settings data: $e");
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  // Helper for dummy actions
+  void _showDummyMessage(String feature) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text("$feature feature will be available in the next update."),
+        backgroundColor: Colors.blueGrey,
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   @override
@@ -82,7 +92,7 @@ class _PatientSettingState extends State<PatientSetting> {
         centerTitle: true,
       ),
       body: _isLoading 
-          ? const Center(child: CircularProgressIndicator())
+          ? const Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70)))
           : SingleChildScrollView(
         padding: const EdgeInsets.all(15),
         child: Column(
@@ -104,10 +114,29 @@ class _PatientSettingState extends State<PatientSetting> {
             ),
             const SizedBox(height: 20),
 
-            // --- ACCOUNT INFO ---
-            _buildSection("Account Info", Icons.person_outline, [
-              _buildListTile("Edit Profile"),
-              _buildListTile("Change Password"),
+            // --- ACCOUNT & SECURITY ---
+            _buildSection("Account & Security", Icons.shield_outlined, [
+              _buildListTile("Edit Profile", onTap: () => _showDummyMessage("Edit Profile")),
+              
+              // 1. DUMMY CHANGE PASSWORD TILE
+              _buildListTile(
+                "Change Account Password", 
+                onTap: () => _showDummyMessage("Change Password"),
+              ),
+
+              // 2. FUNCTIONAL DISPENSER PIN TILE
+              _buildListTile(
+                "Dispenser Security PIN", 
+                trailingText: "4-Digits",
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => PatientPassword(userEmail: widget.userEmail)
+                    ),
+                  );
+                },
+              ),
             ]),
 
             // --- CAREGIVER CONNECTIONS ---
@@ -123,22 +152,21 @@ class _PatientSettingState extends State<PatientSetting> {
               }),
             ]),
 
-            // --- DEVICE SETTINGS (UPDATED) ---
+            // --- HARDWARE SETTINGS ---
             _buildSection("Hardware Settings", Icons.settings_outlined, [
               _buildListTile(
                 "Medicine Dispenser Hardware",
                 trailingText: linkedMachineId != null ? "Linked ($linkedMachineId)" : "Not Connected",
                 dotColor: linkedMachineId != null ? Colors.green : Colors.orange,
                 onTap: () {
-                  // --- NAVIGATION TO LINK MACHINE PAGE ---
                   Navigator.push(
                     context,
                     MaterialPageRoute(builder: (context) => PatientLinkMachine(userEmail: widget.userEmail)),
                   );
                 },
               ),
-              _buildListTile("Configure Wi-Fi"),
-              _buildListTile("Device Calibration"),
+              _buildListTile("Configure Wi-Fi", onTap: () => _showDummyMessage("Wi-Fi Configuration")),
+              _buildListTile("Device Calibration", onTap: () => _showDummyMessage("Calibration")),
             ]),
 
             // --- NOTIFICATIONS ---
@@ -147,15 +175,8 @@ class _PatientSettingState extends State<PatientSetting> {
               _buildSwitchTile("Missed Dose Alerts", missedDoseNotify, (v) => setState(() => missedDoseNotify = v)),
             ]),
 
-            // --- DISPLAY & ACCESSIBILITY ---
-            _buildSection("Accessibility", Icons.text_fields, [
-              _buildSwitchTile("Large Text Mode", largeTextMode, (v) => setState(() => largeTextMode = v)),
-              _buildSwitchTile("High Contrast", highContrast, (v) => setState(() => highContrast = v)),
-            ]),
-
-            const SizedBox(height: 15),
-
             // --- LOGOUT ---
+            const SizedBox(height: 15),
             SizedBox(
               width: double.infinity, height: 55,
               child: ElevatedButton(

@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart'; // --- IMPORT FIRESTORE ---
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class PatientLinked extends StatefulWidget {
   final String userEmail;
@@ -11,11 +11,10 @@ class PatientLinked extends StatefulWidget {
 
 class _PatientLinkedState extends State<PatientLinked> {
   
-  // --- NEW: LOGIC TO DELETE CONNECTION FROM FIREBASE ---
+  // --- LOGIC: DELETE CONNECTION ---
   Future<void> _unlinkProfile(String docId, String name) async {
     try {
       await FirebaseFirestore.instance.collection('connections').doc(docId).delete();
-      
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text("Unlinked from $name"), backgroundColor: Colors.redAccent),
@@ -28,7 +27,7 @@ class _PatientLinkedState extends State<PatientLinked> {
 
   @override
   Widget build(BuildContext context) {
-    // --- NEW: REAL-TIME STREAM OF CONNECTIONS ---
+    // 1. Listen to all connections where the current user is the Patient
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance
           .collection('connections')
@@ -36,7 +35,7 @@ class _PatientLinkedState extends State<PatientLinked> {
           .snapshots(),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+          return const Scaffold(body: Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70))));
         }
 
         if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
@@ -52,56 +51,44 @@ class _PatientLinkedState extends State<PatientLinked> {
         return Scaffold(
           backgroundColor: const Color(0xFFF5F9FF),
           appBar: _buildAppBar(),
-          body: SingleChildScrollView(
+          body: ListView.builder(
             padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  "Active Connections",
-                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  "These individuals can monitor your Smart Medicine Dispenser logs and receive medication alerts.",
-                  style: TextStyle(color: Colors.black54, fontSize: 14),
-                ),
-                const SizedBox(height: 25),
+            itemCount: connectionDocs.length,
+            itemBuilder: (context, index) {
+              var connData = connectionDocs[index].data() as Map<String, dynamic>;
+              
+              // 2. LOGIC FIX: Identify which email key exists in this document
+              String? caregiverEmail = connData['caregiverEmail'];
+              String? healthcareEmail = connData['healthcareEmail'];
+              String targetEmail = caregiverEmail ?? healthcareEmail ?? "";
+              
+              String docId = connectionDocs[index].id;
 
-                // We map each connection to a FutureBuilder to fetch the Caregiver's Name/Role from the 'users' collection
-                ListView.builder(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  itemCount: connectionDocs.length,
-                  itemBuilder: (context, index) {
-                    var connData = connectionDocs[index].data() as Map<String, dynamic>;
-                    String caregiverEmail = connData['caregiverEmail'];
-                    String docId = connectionDocs[index].id;
+              if (targetEmail.isEmpty) return const SizedBox.shrink();
 
-                    return FutureBuilder<QuerySnapshot>(
-                      future: FirebaseFirestore.instance
-                          .collection('users')
-                          .where('email', isEqualTo: caregiverEmail)
-                          .limit(1)
-                          .get(),
-                      builder: (context, userSnapshot) {
-                        if (!userSnapshot.hasData || userSnapshot.data!.docs.isEmpty) {
-                          return const SizedBox.shrink();
-                        }
+              // 3. RELATIONAL LOOKUP: Fetch details from 'users' using the identified email
+              return FutureBuilder<QuerySnapshot>(
+                future: FirebaseFirestore.instance
+                    .collection('users')
+                    .where('email', isEqualTo: targetEmail)
+                    .limit(1)
+                    .get(),
+                builder: (context, userSnapshot) {
+                  if (!userSnapshot.hasData || userSnapshot.data!.docs.isEmpty) {
+                    // This handles cases where the link exists but the user profile is missing
+                    return const SizedBox.shrink();
+                  }
 
-                        var userData = userSnapshot.data!.docs.first.data() as Map<String, dynamic>;
-                        return _buildRequestCard(
-                          docId, 
-                          userData['name'] ?? "Unknown User", 
-                          userData['role'] ?? "Caregiver", 
-                          caregiverEmail
-                        );
-                      },
-                    );
-                  },
-                ),
-              ],
-            ),
+                  var userData = userSnapshot.data!.docs.first.data() as Map<String, dynamic>;
+                  return _buildRequestCard(
+                    docId, 
+                    userData['name'] ?? "Unknown User", 
+                    userData['role'] ?? "Provider", 
+                    targetEmail
+                  );
+                },
+              );
+            },
           ),
         );
       },
@@ -114,8 +101,8 @@ class _PatientLinkedState extends State<PatientLinked> {
         icon: const Icon(Icons.arrow_back_ios, color: Colors.blue, size: 20),
         onPressed: () => Navigator.pop(context),
       ),
-      title: const Text("Linked Caregivers/Providers", 
-        style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+      title: const Text("Trusted Connections", 
+        style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)),
       backgroundColor: Colors.white,
       elevation: 0.5,
       centerTitle: true,
@@ -123,9 +110,10 @@ class _PatientLinkedState extends State<PatientLinked> {
   }
 
   Widget _buildRequestCard(String docId, String name, String role, String email) {
-    IconData roleIcon = role.contains("Healthcare") 
-        ? Icons.medical_services_outlined 
-        : Icons.person_outline;
+    // Dynamic styling based on Role
+    bool isHealthcare = role.contains("Healthcare");
+    IconData roleIcon = isHealthcare ? Icons.medical_services_outlined : Icons.people_outline;
+    Color themeColor = isHealthcare ? Colors.teal : const Color(0xFF1A3B70);
 
     return Container(
       margin: const EdgeInsets.only(bottom: 15),
@@ -133,7 +121,7 @@ class _PatientLinkedState extends State<PatientLinked> {
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(15),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 4))],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -141,8 +129,8 @@ class _PatientLinkedState extends State<PatientLinked> {
           Row(
             children: [
               CircleAvatar(
-                backgroundColor: const Color(0xFFE3F2FD),
-                child: Icon(roleIcon, color: const Color(0xFF1A3B70)),
+                backgroundColor: isHealthcare ? const Color(0xFFE0F2F1) : const Color(0xFFE3F2FD),
+                child: Icon(roleIcon, color: themeColor),
               ),
               const SizedBox(width: 15),
               Expanded(
@@ -150,8 +138,10 @@ class _PatientLinkedState extends State<PatientLinked> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
-                    Text(role.replaceAll('\n', ' '), 
-                      style: const TextStyle(color: Colors.blue, fontSize: 12, fontWeight: FontWeight.w600)),
+                    Text(
+                      role.replaceAll('\n', ' ').toUpperCase(), 
+                      style: TextStyle(color: themeColor, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 0.5)
+                    ),
                   ],
                 ),
               ),
@@ -160,21 +150,26 @@ class _PatientLinkedState extends State<PatientLinked> {
           const SizedBox(height: 15),
           const Divider(),
           const SizedBox(height: 10),
-          Text("Email: $email", style: const TextStyle(color: Colors.black54, fontSize: 13)),
-          const SizedBox(height: 20),
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: () => _unlinkProfile(docId, name),
-                  icon: const Icon(Icons.link_off, size: 18),
-                  label: const Text("Unlink Profile"),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.redAccent,
-                    side: const BorderSide(color: Colors.redAccent),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text("REGISTERED EMAIL", style: TextStyle(color: Colors.grey, fontSize: 9, fontWeight: FontWeight.bold)),
+                    Text(email, style: const TextStyle(color: Colors.black87, fontSize: 13)),
+                  ],
+                ),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => _unlinkProfile(docId, name),
+                icon: const Icon(Icons.link_off, size: 14),
+                label: const Text("Revoke", style: TextStyle(fontSize: 11)),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.redAccent,
+                  side: const BorderSide(color: Colors.redAccent),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                 ),
               ),
             ],
@@ -189,11 +184,15 @@ class _PatientLinkedState extends State<PatientLinked> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.people_outline, size: 80, color: Colors.grey[300]),
+          Icon(Icons.supervised_user_circle_outlined, size: 80, color: Colors.grey[300]),
           const SizedBox(height: 15),
           const Text("No active connections.", style: TextStyle(color: Colors.grey, fontSize: 16, fontWeight: FontWeight.w500)),
           const SizedBox(height: 5),
-          const Text("Your linked caregivers will appear here.", style: TextStyle(color: Colors.grey, fontSize: 13)),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 40),
+            child: Text("Link with a family member or doctor to enable remote monitoring.", 
+              textAlign: TextAlign.center, style: TextStyle(color: Colors.grey, fontSize: 13)),
+          ),
         ],
       ),
     );

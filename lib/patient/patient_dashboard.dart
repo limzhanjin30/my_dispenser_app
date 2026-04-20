@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; 
 import 'package:intl/intl.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../custom_bottom_nav.dart';
 import '../login.dart';
-import 'patient_schedule.dart'; 
 import 'patient_link_machine.dart'; 
 
 class PatientDashboard extends StatefulWidget {
@@ -17,11 +17,13 @@ class PatientDashboard extends StatefulWidget {
 class _PatientDashboardState extends State<PatientDashboard> with TickerProviderStateMixin {
   String fullName = "Patient";
   String? linkedMachineId;
-  Map<String, dynamic>? nextDose;
+  
+  List<Map<String, dynamic>> _availableDoses = [];
+  Map<String, dynamic>? _selectedDose; 
+
   List<dynamic> todaySchedule = [];
   bool _isLoading = true;
   bool _isProcessingTaken = false;
-  bool _showRefillAlert = false; 
 
   late AnimationController _pulseController;
   late Animation<double> _scaleAnimation;
@@ -34,11 +36,8 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
   }
 
   void _initAnimation() {
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1000),
-    );
-    _scaleAnimation = Tween<double>(begin: 1.0, end: 1.05).animate(
+    _pulseController = AnimationController(vsync: this, duration: const Duration(milliseconds: 1000));
+    _scaleAnimation = Tween<double>(begin: 1.0, end: 1.03).animate(
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
   }
@@ -49,76 +48,165 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     super.dispose();
   }
 
-  // --- DATABASE: CONFIRM DOSE & HANDLE COURSE COMPLETION ---
-  Future<void> _markAsTaken() async {
-    if (nextDose == null || linkedMachineId == null) return;
-    setState(() => _isProcessingTaken = true);
-
-    // Declare variables here so they are accessible throughout the whole function scope
-    bool isLate = false;
-    bool isFinalDay = false;
+  Future<bool> _promptForDispenserPin() async {
+    final TextEditingController pinController = TextEditingController();
+    String? errorText;
+    String? correctPin;
 
     try {
-      final String machineId = linkedMachineId!;
-      final int targetSlot = nextDose!['slot'];
-      final DateTime now = DateTime.now();
-      final DateTime todayMidnight = DateTime(now.year, now.month, now.day);
-      final DateTime scheduledTime = nextDose!['fullTime'];
+      var userSnap = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .limit(1)
+          .get();
       
-      // Calculate 'isLate' here
-      isLate = now.isAfter(scheduledTime.add(const Duration(minutes: 30)));
-      String finalAdherenceStatus = isLate ? "Late" : "Taken";
+      if (userSnap.docs.isNotEmpty) {
+        correctPin = userSnap.docs.first.data()['dispenserPin'];
+      }
+    } catch (e) { debugPrint("PIN Error: $e"); }
 
+    if (correctPin == null) {
+      _showErrorSnackBar("Please set a Dispenser PIN in Settings first.");
+      return false;
+    }
+
+    return await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: const Text("Verify Dispenser PIN", textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text("Enter PIN to unlock medication bin.", style: TextStyle(fontSize: 12, color: Colors.grey)),
+                const SizedBox(height: 25),
+                TextField(
+                  controller: pinController,
+                  obscureText: true,
+                  textAlign: TextAlign.center,
+                  keyboardType: TextInputType.number,
+                  style: const TextStyle(letterSpacing: 20, fontSize: 26, fontWeight: FontWeight.bold),
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(4)],
+                  decoration: InputDecoration(
+                    errorText: errorText,
+                    hintText: "••••",
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context, false), child: const Text("Cancel")),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A3B70)),
+                onPressed: () {
+                  if (pinController.text == correctPin) Navigator.pop(context, true);
+                  else setDialogState(() => errorText = "Incorrect PIN");
+                },
+                child: const Text("Unlock Bin", style: TextStyle(color: Colors.white)),
+              ),
+            ],
+          );
+        }
+      ),
+    ) ?? false;
+  }
+
+  // --- DATABASE: MARK SPECIFIC DOSE LOG AS TAKEN ---
+  Future<void> _markAsTaken() async {
+    if (_selectedDose == null || linkedMachineId == null) return;
+    
+    final doseToLog = _selectedDose!;
+    bool isAuthorized = await _promptForDispenserPin();
+    if (!isAuthorized) return;
+
+    setState(() => _isProcessingTaken = true);
+    final DateTime now = DateTime.now();
+    final String todayStr = DateFormat('yyyy-MM-dd').format(now);
+    final String tomorrowStr = DateFormat('yyyy-MM-dd').format(now.add(const Duration(days: 1)));
+    
+    bool isLate = now.isAfter(doseToLog['fullTime'].add(const Duration(minutes: 30)));
+    String finalStatus = isLate ? "Late" : "Taken";
+
+    try {
+      // 1. UPDATE THE LOG FOR TODAY
+      var logQuery = await FirebaseFirestore.instance
+          .collection('adherence_logs')
+          .where('patientEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .where('slot', isEqualTo: doseToLog['slot'])
+          .where('date', isEqualTo: todayStr)
+          .where('times', arrayContains: doseToLog['displayTime']) 
+          .limit(1)
+          .get();
+
+      if (logQuery.docs.isNotEmpty) {
+        await logQuery.docs.first.reference.update({
+          "adherenceStatus": finalStatus,
+          "takenTime": DateFormat('hh:mm a').format(now),
+          "lastTakenTime": DateFormat('hh:mm a').format(now),
+          "isDone": true,
+          "timestamp": FieldValue.serverTimestamp(),
+        });
+      }
+
+      // 2. NEW LOOK-AHEAD LOGIC: Check if there is medicine tomorrow
+      var tomorrowLogs = await FirebaseFirestore.instance
+          .collection('adherence_logs')
+          .where('patientEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
+          .where('slot', isEqualTo: doseToLog['slot'])
+          .where('date', isEqualTo: tomorrowStr)
+          .limit(1)
+          .get();
+
+      bool hasDoseTomorrow = tomorrowLogs.docs.isNotEmpty;
+
+      // 3. UPDATE PHYSICAL MACHINE STATE
+      final String machineId = linkedMachineId!;
       DocumentSnapshot machineDoc = await FirebaseFirestore.instance.collection('machines').doc(machineId).get();
 
       if (machineDoc.exists) {
         List<dynamic> slots = List.from(machineDoc.get('slots'));
         for (int i = 0; i < slots.length; i++) {
-          if (slots[i]['slot'] == targetSlot) {
-            // Check if this is the final day
-            DateTime endDate = DateTime.parse(slots[i]['endDate']);
-            isFinalDay = todayMidnight.isAtSameMomentAs(endDate) || todayMidnight.isAfter(endDate);
-
-            if (isFinalDay) {
-              // LOGIC: Change status to "Finished" so record remains but hardware is released
-              slots[i]['status'] = "Finished";
-              slots[i]['isLocked'] = false; 
+          if (slots[i]['slot'] == doseToLog['slot']) {
+            if (hasDoseTomorrow) {
+              // CONTINUE COURSE: Show "Awaiting Refill" in Inventory
               slots[i]['isDone'] = true; 
-              slots[i]['lastTakenDate'] = DateFormat('yyyy-MM-dd').format(now);
-              slots[i]['lastTakenTime'] = DateFormat('hh:mm a').format(now);
-              slots[i]['adherenceStatus'] = finalAdherenceStatus;
+              slots[i]['isLocked'] = false; 
+              slots[i]['adherenceStatus'] = finalStatus;
             } else {
-              // COURSE CONTINUES
-              slots[i]['isDone'] = true; 
-              slots[i]['isLocked'] = false; 
-              slots[i]['lastTakenDate'] = DateFormat('yyyy-MM-dd').format(now); 
-              slots[i]['lastTakenTime'] = DateFormat('hh:mm a').format(now); 
-              slots[i]['adherenceStatus'] = finalAdherenceStatus;
+              // FINISH COURSE: Set slot to Empty (removes from Inventory)
+              slots[i]['status'] = "Empty";
+              slots[i]['isDone'] = false;
+              slots[i]['isLocked'] = false;
+              slots[i]['medDetails'] = "";
+              slots[i]['patientEmail'] = "";
+              slots[i]['times'] = [];
             }
-            break; // Exits loop, but isFinalDay/isLate are still saved
+            slots[i]['lastTakenDate'] = todayStr;
+            slots[i]['lastTakenTime'] = DateFormat('hh:mm a').format(now);
+            break;
           }
         }
-        
         await FirebaseFirestore.instance.collection('machines').doc(machineId).update({'slots': slots});
-        
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text("Dose confirmed. ${isFinalDay ? 'Course Completed!' : ''}"), 
-              backgroundColor: isLate ? Colors.orange : Colors.teal,
-              duration: const Duration(seconds: 2),
-            )
-          );
-        }
       }
+      
+      setState(() => _selectedDose = null);
+      _showSuccessSnackBar("${doseToLog['name']} confirmed!");
+      
     } catch (e) {
-      debugPrint("Confirm Error: $e");
+      debugPrint("Update Error: $e");
     } finally {
       if (mounted) setState(() => _isProcessingTaken = false);
     }
   }
 
-  // --- DATABASE: FETCH & MONITOR ---
+  void _showErrorSnackBar(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.redAccent));
+  void _showSuccessSnackBar(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.teal));
+
+  // --- DATA FETCHING ---
   Future<void> _fetchUserAndMachineData() async {
     final String cleanEmail = widget.userEmail.trim().toLowerCase();
     if (!mounted) return;
@@ -126,111 +214,72 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
 
     try {
       var userSnapshot = await FirebaseFirestore.instance.collection('users').where('email', isEqualTo: cleanEmail).limit(1).get();
-
       if (userSnapshot.docs.isNotEmpty) {
         var userData = userSnapshot.docs.first.data();
         fullName = userData['name'] ?? "Patient";
         linkedMachineId = userData['linkedMachineId'];
 
         if (linkedMachineId != null) {
-          FirebaseFirestore.instance.collection('machines').doc(linkedMachineId).snapshots().listen((snap) {
-            if (snap.exists && mounted) {
-              _processMachineSlots(snap.data()!['slots'] ?? []);
-            }
-          });
+          String todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
+          FirebaseFirestore.instance.collection('adherence_logs')
+              .where('patientEmail', isEqualTo: cleanEmail)
+              .where('date', isEqualTo: todayStr)
+              .snapshots().listen((logSnap) {
+                if (mounted) _processGranularLogs(logSnap.docs);
+              });
         } else {
           if (mounted) setState(() => _isLoading = false);
         }
       }
-    } catch (e) {
-      if (mounted) setState(() => _isLoading = false);
-    }
+    } catch (e) { if (mounted) setState(() => _isLoading = false); }
   }
 
-  // --- CORE LOGIC: PROCESS TODAY + "FINISHED" SLOTS ---
-  void _processMachineSlots(List<dynamic> slots) {
+  void _processGranularLogs(List<QueryDocumentSnapshot> logs) {
     DateTime now = DateTime.now();
     DateTime todayMidnight = DateTime(now.year, now.month, now.day);
-    String todayStr = DateFormat('yyyy-MM-dd').format(now);
+    List<Map<String, dynamic>> schedule = [];
+    List<Map<String, dynamic>> availableToTake = [];
+
+    for (var doc in logs) {
+      var data = doc.data() as Map<String, dynamic>;
+      if (data['finalStatus'] == "Course Terminated") continue;
+
+      String timeStr = (data['times'] is List && (data['times'] as List).isNotEmpty) 
+          ? (data['times'] as List).first 
+          : "00:00 AM";
+
+      DateTime fullTime = _parseTimeString(timeStr, todayMidnight);
+      String status = data['adherenceStatus'] ?? "Upcoming";
+      bool isDone = (status.toLowerCase() == "taken" || status.toLowerCase() == "late");
+
+      var doseInfo = {
+        "name": data['medDetails'] ?? data['medName'] ?? "Medicine", 
+        "fullTime": fullTime, "displayTime": timeStr, "isDone": isDone, 
+        "adherenceStatus": status, "slot": data['slot'],
+      };
+      
+      schedule.add(doseInfo);
+      if (!isDone && now.isAfter(fullTime.subtract(const Duration(minutes: 30)))) {
+        availableToTake.add(doseInfo);
+      }
+    }
+
+    schedule.sort((a, b) => (a['fullTime'] as DateTime).compareTo(b['fullTime'] as DateTime));
+    availableToTake.sort((a, b) => (a['fullTime'] as DateTime).compareTo(b['fullTime'] as DateTime));
     
-    bool needsAutoExpirySync = false;
-    List<Map<String, dynamic>> todayScheduleList = [];
-    final String myEmail = widget.userEmail.trim().toLowerCase();
-
-    for (int i = 0; i < slots.length; i++) {
-      var slot = slots[i];
-      if (slot['status'] == "Empty") continue;
-
-      // 1. AUTO-EXPIRY: If date passed, mark as "Finished" instead of "Empty"
-      DateTime endDate = DateTime.parse(slot['endDate'] ?? todayStr);
-      if (now.isAfter(endDate.add(const Duration(days: 1))) && slot['status'] == "Occupied") {
-        slots[i]['status'] = "Finished";
-        slots[i]['isLocked'] = false;
-        needsAutoExpirySync = true;
-      }
-
-      if (slot['patientEmail'] != myEmail) continue;
-
-      // Filter for Today's Alarms
-      DateTime start = DateTime.parse(slot['startDate'] ?? todayStr);
-      if (todayMidnight.isBefore(DateTime(start.year, start.month, start.day)) || todayMidnight.isAfter(endDate)) continue;
-
-      bool isDoneToday = slot['lastTakenDate'] == todayStr || slot['status'] == "Finished";
-      List<String> times = List<String>.from(slot['times'] ?? []);
-
-      for (var t in times) {
-        todayScheduleList.add({
-          "name": slot['medDetails'] ?? "Medication",
-          "fullTime": _parseTimeString(t, todayMidnight),
-          "displayTime": t,
-          "isDone": isDoneToday,
-          "adherenceStatus": slot['adherenceStatus'] ?? "Taken",
-          "slot": slot['slot'],
-          "status": slot['status'], // Track if Occupied or Finished
-          "isPhysicallyEmpty": slot['isDone'] ?? false, 
-        });
-      }
-    }
-
-    todayScheduleList.sort((a, b) => (a['fullTime'] as DateTime).compareTo(b['fullTime'] as DateTime));
-
-    // NEXT DOSE: First dose that is not done and status is still "Occupied"
-    Map<String, dynamic>? upcoming;
-    try {
-      upcoming = todayScheduleList.firstWhere((dose) => dose['isDone'] == false && dose['status'] == "Occupied");
-    } catch (e) { upcoming = null; }
-
-    // REFILL ALERT: Only for active "Occupied" slots
-    bool refillWarning = false;
-    if (upcoming != null && upcoming['isPhysicallyEmpty'] == true) {
-      if (upcoming['fullTime'].difference(now).inMinutes <= 60) {
-        refillWarning = true;
-      }
-    }
-
-    if (needsAutoExpirySync && linkedMachineId != null) {
-      FirebaseFirestore.instance.collection('machines').doc(linkedMachineId).update({'slots': slots});
-    }
-
-    if (upcoming != null && upcoming['fullTime'].difference(now).inMinutes <= 30) {
-      _pulseController.repeat(reverse: true);
-    } else {
-      _pulseController.stop();
-    }
+    if (availableToTake.isNotEmpty) _pulseController.repeat(reverse: true); 
+    else _pulseController.stop();
 
     if (mounted) {
-      setState(() {
-        todaySchedule = todayScheduleList;
-        nextDose = upcoming;
-        _showRefillAlert = refillWarning;
-        _isLoading = false;
-      });
+      setState(() { todaySchedule = schedule; _availableDoses = availableToTake; _isLoading = false; });
     }
   }
 
   DateTime _parseTimeString(String timeStr, DateTime ref) {
-    DateTime p = DateFormat("hh:mm a").parse(timeStr);
-    return DateTime(ref.year, ref.month, ref.day, p.hour, p.minute);
+    try {
+      DateTime p = DateFormat("hh:mm a").parse(timeStr);
+      return DateTime(ref.year, ref.month, ref.day, p.hour, p.minute);
+    } catch (e) { return ref; }
   }
 
   String _getCountdownText(DateTime target) {
@@ -244,46 +293,29 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     return Scaffold(
       backgroundColor: const Color(0xFFF5F9FF),
       appBar: AppBar(
-        leading: IconButton(icon: const Icon(Icons.logout, color: Colors.black87, size: 20), onPressed: () => Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (context) => const LoginPage()), (route) => false)),
-        title: const Text("Patient Dashboard", style: TextStyle(color: Colors.black87, fontWeight: FontWeight.bold)),
+        leading: IconButton(icon: const Icon(Icons.logout, size: 20), onPressed: () => Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (context) => const LoginPage()), (route) => false)),
+        title: const Text("Patient Dashboard", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
         backgroundColor: Colors.transparent, elevation: 0, centerTitle: true,
       ),
       body: _isLoading 
-        ? const Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70)))
+        ? const Center(child: CircularProgressIndicator())
         : RefreshIndicator(
-          onRefresh: _fetchUserAndMachineData,
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
+            onRefresh: _fetchUserAndMachineData,
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 _buildHeader(),
-                const SizedBox(height: 20),
-                if (_showRefillAlert) _buildRefillWarningBanner(),
-                const SizedBox(height: 10),
-                linkedMachineId == null ? _buildLinkMachinePrompt() : _buildNextDoseCard(),
-                const SizedBox(height: 30),
-                const Text("Today's Schedule", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
+                const SizedBox(height: 25),
+                linkedMachineId == null ? _buildLinkMachinePrompt() : _buildSelectionSection(),
+                const SizedBox(height: 35),
+                const Text("Today's Medication Plan", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
                 const SizedBox(height: 15),
                 _buildScheduleList(),
                 const SizedBox(height: 30),
-              ],
+              ]),
             ),
           ),
-        ),
       bottomNavigationBar: CustomBottomNavBar(currentIndex: 0, role: "Patient", userEmail: widget.userEmail),
-    );
-  }
-
-  Widget _buildRefillWarningBanner() {
-    return Container(
-      width: double.infinity, padding: const EdgeInsets.all(15), margin: const EdgeInsets.only(bottom: 15),
-      decoration: BoxDecoration(color: Colors.red.shade600, borderRadius: BorderRadius.circular(15)),
-      child: Row(children: [
-        const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 28),
-        const SizedBox(width: 15),
-        const Expanded(child: Text("BIN REFILL REQUIRED: Hardware detected empty bin for next dose.", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12))),
-      ]),
     );
   }
 
@@ -297,34 +329,80 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     ]);
   }
 
-  Widget _buildNextDoseCard() {
-    if (nextDose == null) return _buildStaticInfoCard("Schedule Complete", "All confirmed.");
-    DateTime sched = nextDose!['fullTime'];
-    bool canPress = DateTime.now().isAfter(sched.subtract(const Duration(minutes: 30)));
-    bool overdue = DateTime.now().isAfter(sched.add(const Duration(minutes: 30)));
+  Widget _buildSelectionSection() {
+    if (_availableDoses.isEmpty) {
+      return Container(width: double.infinity, padding: const EdgeInsets.all(35), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25)), child: Column(children: [const Icon(Icons.verified, color: Colors.green, size: 45), const SizedBox(height: 15), const Text("All Caught Up!", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), const Text("No doses are currently due.", style: TextStyle(color: Colors.grey, fontSize: 13))]));
+    }
 
-    return Container(
-      width: double.infinity, padding: const EdgeInsets.all(25),
-      decoration: BoxDecoration(
-        color: overdue ? Colors.red.shade50 : (canPress ? const Color(0xFF1A3B70) : Colors.white), 
-        borderRadius: BorderRadius.circular(25), border: overdue ? Border.all(color: Colors.red.shade200, width: 2) : Border.all(color: Colors.grey.shade100),
-      ),
-      child: Column(children: [
-        Text(overdue ? "OVERDUE" : (canPress ? "DUE NOW" : "UPCOMING:"), style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: canPress ? Colors.white70 : Colors.blueGrey)),
-        const SizedBox(height: 5),
-        Text(_getCountdownText(sched), style: TextStyle(fontSize: 48, fontWeight: FontWeight.bold, color: canPress ? Colors.white : const Color(0xFF1A3B70))),
-        Text("${nextDose!['name']} (Bin ${nextDose!['slot']})", style: TextStyle(color: canPress ? Colors.white : Colors.grey, fontSize: 16)),
-        if (canPress) ...[
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text("Select medication to take now:", style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+        const SizedBox(height: 12),
+        SizedBox(
+          height: 100,
+          child: ListView.builder(
+            scrollDirection: Axis.horizontal,
+            itemCount: _availableDoses.length,
+            itemBuilder: (context, index) {
+              final dose = _availableDoses[index];
+              bool isSelected = _selectedDose != null && _selectedDose!['slot'] == dose['slot'] && _selectedDose!['displayTime'] == dose['displayTime'];
+              return GestureDetector(
+                onTap: () => setState(() => _selectedDose = dose),
+                child: Container(
+                  width: 140,
+                  margin: const EdgeInsets.only(right: 12),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: isSelected ? const Color(0xFF1A3B70) : Colors.white,
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(color: isSelected ? Colors.blueAccent : Colors.grey.shade200, width: 2),
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(dose['name'], maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.black87)),
+                      const SizedBox(height: 4),
+                      Text("Bin ${dose['slot']}", style: TextStyle(fontSize: 11, color: isSelected ? Colors.white70 : Colors.grey)),
+                      Text(dose['displayTime'], style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.blueGrey)),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        const SizedBox(height: 25),
+        if (_selectedDose != null) _buildActionCard() else _buildInstructionsCard(),
+      ],
+    );
+  }
+
+  Widget _buildActionCard() {
+    DateTime sched = _selectedDose!['fullTime'];
+    bool overdue = DateTime.now().isAfter(sched.add(const Duration(minutes: 30)));
+    return ScaleTransition(
+      scale: _scaleAnimation,
+      child: Container(
+        width: double.infinity, padding: const EdgeInsets.all(25),
+        decoration: BoxDecoration(color: overdue ? Colors.red.shade50 : const Color(0xFF1A3B70), borderRadius: BorderRadius.circular(25), border: overdue ? Border.all(color: Colors.red.shade200, width: 2) : null),
+        child: Column(children: [
+          Text(overdue ? "OVERDUE" : "DUE NOW", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.white70)),
+          const SizedBox(height: 8),
+          Text(_getCountdownText(sched), style: const TextStyle(fontSize: 42, fontWeight: FontWeight.bold, color: Colors.white)),
+          Text("Ready to take ${_selectedDose!['name']}", style: const TextStyle(color: Colors.white, fontSize: 15)),
           const SizedBox(height: 25),
           SizedBox(width: double.infinity, child: ElevatedButton(
             onPressed: _isProcessingTaken ? null : _markAsTaken, 
-            style: ElevatedButton.styleFrom(backgroundColor: overdue ? Colors.red : Colors.green, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)), padding: const EdgeInsets.symmetric(vertical: 15)), 
-            child: _isProcessingTaken ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text("TAKEN", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.green, padding: const EdgeInsets.symmetric(vertical: 15), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))), 
+            child: _isProcessingTaken ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text("PRESS TO CONFIRM TAKEN", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
           )),
-        ]
-      ]),
+        ]),
+      ),
     );
   }
+
+  Widget _buildInstructionsCard() => Container(width: double.infinity, padding: const EdgeInsets.all(30), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25), border: Border.all(color: Colors.grey.shade100)), child: Column(children: [Icon(Icons.touch_app, size: 40, color: Colors.grey[400]), const SizedBox(height: 10), const Text("Select a medicine to confirm intake", style: TextStyle(color: Colors.grey, fontSize: 13, fontWeight: FontWeight.bold))]));
 
   Widget _buildScheduleList() {
     return Container(
@@ -335,25 +413,23 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
         separatorBuilder: (context, index) => Divider(height: 1, color: Colors.grey.shade50),
         itemBuilder: (context, index) {
           final item = todaySchedule[index];
-          String status = "UPCOMING"; Color color = Colors.blueGrey;
-          if (item['isDone']) {
-            status = item['adherenceStatus'].toString().toUpperCase();
-            color = item['adherenceStatus'] == "Late" ? Colors.orange : Colors.green;
-          } else if (DateTime.now().isAfter(item['fullTime'].add(const Duration(minutes: 30)))) { 
-            status = "MISSED"; color = Colors.red; 
+          String statusStr = item['adherenceStatus'].toString().toUpperCase();
+          if (!item['isDone']) {
+            statusStr = DateTime.now().isAfter(item['fullTime'].add(const Duration(minutes: 30))) ? "MISSED" : "UPCOMING";
           }
+          Color color = statusStr == "TAKEN" ? Colors.green : (statusStr == "MISSED" ? Colors.red : Colors.blueGrey);
+          if (statusStr == "LATE") color = Colors.orange;
 
           return ListTile(
-            leading: Icon(item['isDone'] ? Icons.check_circle : (status == "MISSED" ? Icons.error : Icons.radio_button_off), color: color),
+            leading: Icon(item['isDone'] ? Icons.check_circle : (statusStr == "MISSED" ? Icons.error : Icons.radio_button_off), color: color),
             title: Text(item['displayTime'], style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-            subtitle: Text("${item['name']} ${item['status'] == 'Finished' ? '(Completed Course)' : ''}"), // UI hint for finished course
-            trailing: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4), decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(8)), child: Text(status, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 10))),
+            subtitle: Text(item['name']),
+            trailing: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4), decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(8)), child: Text(statusStr, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 10))),
           );
         },
       ),
     );
   }
 
-  Widget _buildStaticInfoCard(String t, String s) => Container(width: double.infinity, padding: const EdgeInsets.all(35), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25)), child: Column(children: [const Icon(Icons.verified_user_outlined, color: Colors.green, size: 45), const SizedBox(height: 15), Text(t, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), Text(s, textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey, fontSize: 13))]));
-  Widget _buildLinkMachinePrompt() => Container(width: double.infinity, padding: const EdgeInsets.all(30), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25)), child: Column(children: [const Icon(Icons.link_off, color: Colors.orange, size: 50), const SizedBox(height: 15), const Text("No Machine", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), ElevatedButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => PatientLinkMachine(userEmail: widget.userEmail))), child: const Text("Link"))]));
+  Widget _buildLinkMachinePrompt() => Container(width: double.infinity, padding: const EdgeInsets.all(30), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25)), child: Column(children: [const Icon(Icons.link_off, color: Colors.orange, size: 50), const SizedBox(height: 15), const Text("No Hub Found", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), ElevatedButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => PatientLinkMachine(userEmail: widget.userEmail))), child: const Text("Link Device"))]));
 }

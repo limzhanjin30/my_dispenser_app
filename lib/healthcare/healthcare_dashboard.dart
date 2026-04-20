@@ -4,7 +4,7 @@ import 'package:intl/intl.dart';
 import '../custom_bottom_nav.dart';
 import '../login.dart';
 import 'healthcare_linked.dart';
-import 'healthcare_adherence.dart';
+import 'healthcare_prescription.dart';
 
 class HealthcareDashboard extends StatefulWidget {
   final String userEmail; 
@@ -19,7 +19,7 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
   int _totalPatients = 0;
   int _atRiskPatients = 0;
   String _avgAdherence = "0%";
-  List<Map<String, dynamic>> _criticalAlerts = [];
+  List<Map<String, dynamic>> _clinicalActivityFeed = [];
   bool _isLoading = true;
 
   @override
@@ -28,104 +28,92 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
     _setupClinicalSync();
   }
 
-  // --- ARCHITECTURE: MULTI-PATIENT CLINICAL MONITORING ---
+  // --- LOGIC: PER-DOSE ADHERENCE SYNC ---
+// REPLACE the _setupClinicalSync method in HealthcareDashboard with this version:
+
   void _setupClinicalSync() {
     final String clinicalEmail = widget.userEmail.trim().toLowerCase();
     final DateTime now = DateTime.now();
     final String todayStr = DateFormat('yyyy-MM-dd').format(now);
 
-    // 1. Fetch Provider Profile
-    FirebaseFirestore.instance
-        .collection('users')
-        .where('email', isEqualTo: clinicalEmail)
-        .limit(1)
-        .snapshots()
-        .listen((snap) {
-      if (snap.docs.isNotEmpty && mounted) {
-        setState(() => fullName = snap.docs.first.get('name') ?? "Healthcare Provider");
-      }
+    FirebaseFirestore.instance.collection('users').where('email', isEqualTo: clinicalEmail).limit(1).snapshots().listen((snap) {
+      if (snap.docs.isNotEmpty && mounted) setState(() => fullName = snap.docs.first.get('name') ?? "Provider");
     });
 
-    // 2. Listen to Clinical Connections
-    FirebaseFirestore.instance
-        .collection('connections')
-        .where('healthcareEmail', isEqualTo: clinicalEmail)
-        .snapshots()
-        .listen((connectionSnap) async {
-      
-      int totalScheduled = 0;
-      int totalTaken = 0;
-      int atRiskCount = 0;
-      List<Map<String, dynamic>> alerts = [];
+    FirebaseFirestore.instance.collection('connections').where('healthcareEmail', isEqualTo: clinicalEmail).snapshots().listen((connectionSnap) async {
+      List<String> patientEmails = connectionSnap.docs.map((d) => d.get('patientEmail').toString().toLowerCase().trim()).toList();
+      if (patientEmails.isEmpty) {
+        if (mounted) setState(() { _isLoading = false; _totalPatients = 0; _clinicalActivityFeed = []; });
+        return;
+      }
 
-      for (var doc in connectionSnap.docs) {
-        String pEmail = doc.get('patientEmail').toString().toLowerCase();
-
-        // Step A: Find Patient Hardware
-        var pUserSnap = await FirebaseFirestore.instance.collection('users').where('email', isEqualTo: pEmail).limit(1).get();
-        if (pUserSnap.docs.isEmpty) continue;
+      FirebaseFirestore.instance.collection('adherence_logs')
+          .where('patientEmail', whereIn: patientEmails)
+          .where('date', isEqualTo: todayStr)
+          .snapshots().listen((logSnap) {
         
-        var pData = pUserSnap.docs.first.data();
-        String pName = pData['name'] ?? "Unknown";
-        String? machineId = pData['linkedMachineId'];
+        int totalScheduled = logSnap.docs.length;
+        int totalTaken = 0;
+        Set<String> atRiskEmails = {}; 
+        List<Map<String, dynamic>> feed = [];
 
-        if (machineId == null || machineId.isEmpty) continue;
+        for (var doc in logSnap.docs) {
+          var data = doc.data() as Map<String, dynamic>;
+          if (data['finalStatus'] == "Course Terminated") continue;
 
-        // Step B: Audit Hardware State
-        var machineDoc = await FirebaseFirestore.instance.collection('machines').doc(machineId).get();
-        if (machineDoc.exists) {
-          List<dynamic> slots = List.from(machineDoc.data()?['slots'] ?? []);
-          bool patientHasMissed = false;
+          String status = (data['adherenceStatus'] ?? "Upcoming").toString().toLowerCase().trim();
+          String med = data['medName'] ?? data['medDetails'] ?? "Medication";
+          String schedT = (data['times'] as List).isNotEmpty ? (data['times'] as List).first : "--:--";
+          String takenT = data['takenTime'] ?? data['lastTakenTime'] ?? "";
+          String pName = data['patientName'] ?? "Patient";
 
-          for (var slot in slots) {
-            if (slot['patientEmail'] != pEmail || slot['status'] == "Empty") continue;
+          Color color; IconData icon; String msg;
 
-            // Date validation for today
-            DateTime end = DateTime.parse(slot['endDate'] ?? todayStr);
-            if (now.isAfter(end.add(const Duration(days: 1)))) continue;
+          if (status == "taken") {
+            totalTaken++; color = Colors.green; icon = Icons.check_circle;
+            msg = "$pName: Dose Taken";
+          } else if (status == "late") {
+            totalTaken++; color = Colors.orange; icon = Icons.priority_high;
+            msg = "$pName: LATE Intake";
+          } else {
+            bool isActuallyMissed = false;
+            try {
+              DateTime st = DateFormat("hh:mm a").parse(schedT);
+              DateTime fullS = DateTime(now.year, now.month, now.day, st.hour, st.minute);
+              if (now.isAfter(fullS.add(const Duration(minutes: 30)))) isActuallyMissed = true;
+            } catch (e) {}
 
-            List<String> times = List<String>.from(slot['times'] ?? []);
-            bool isTakenToday = slot['lastTakenDate'] == todayStr || slot['status'] == "Finished";
-
-            for (String t in times) {
-              totalScheduled++;
-              DateTime scheduledTime = _parseTimeString(t);
-              DateTime graceLimit = scheduledTime.add(const Duration(minutes: 30));
-
-              if (isTakenToday) {
-                totalTaken++;
-                if (slot['adherenceStatus'] == "Late") {
-                  alerts.add({"msg": "$pName: Late Dose", "sub": "${slot['medDetails']} taken late at ${slot['lastTakenTime']}", "color": Colors.orange, "icon": Icons.access_time});
-                }
-              } else if (now.isAfter(graceLimit)) {
-                patientHasMissed = true;
-                alerts.add({"msg": "$pName: MISSED DOSE", "sub": "${slot['medDetails']} schedule for $t was missed.", "color": Colors.red, "icon": Icons.error_outline});
-              }
+            if (isActuallyMissed || status == "missed") {
+              atRiskEmails.add(data['patientEmail']);
+              color = Colors.red; icon = Icons.error_outline;
+              msg = "$pName: MISSED Dose";
+            } else {
+              color = Colors.blueGrey; icon = Icons.watch_later_outlined;
+              msg = "$pName: Upcoming";
             }
           }
-          if (patientHasMissed) atRiskCount++;
+
+          feed.add({
+            "patientEmail": data['patientEmail'],
+            "msg": msg,
+            "sub": "$med | Sched: $schedT ${status == 'upcoming' ? '' : '| Action: ' + takenT}",
+            "color": color,
+            "icon": icon,
+            "timestamp": (data['timestamp'] as Timestamp?)?.toDate() ?? now,
+          });
         }
-      }
 
-      // Calculate Clinical Adherence Rate
-      double adherenceRate = totalScheduled > 0 ? (totalTaken / totalScheduled) * 100 : 0;
+        feed.sort((a, b) => b['timestamp'].compareTo(a['timestamp']));
 
-      if (mounted) {
-        setState(() {
-          _totalPatients = connectionSnap.docs.length;
-          _atRiskPatients = atRiskCount;
-          _avgAdherence = "${adherenceRate.toStringAsFixed(0)}%";
-          _criticalAlerts = alerts;
+        if (mounted) setState(() {
+          _totalPatients = patientEmails.length;
+          _atRiskPatients = atRiskEmails.length;
+          _avgAdherence = totalScheduled > 0 ? "${((totalTaken / totalScheduled) * 100).toStringAsFixed(0)}%" : "0%";
+          _clinicalActivityFeed = feed;
           _isLoading = false;
         });
-      }
+      });
     });
-  }
-
-  DateTime _parseTimeString(String timeStr) {
-    DateTime now = DateTime.now();
-    DateTime p = DateFormat("hh:mm a").parse(timeStr);
-    return DateTime(now.year, now.month, now.day, p.hour, p.minute);
   }
 
   @override
@@ -138,119 +126,105 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
           onPressed: () => Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (context) => const LoginPage()), (route) => false),
         ),
         backgroundColor: const Color(0xFF1A3B70), elevation: 0,
-        title: const Row(children: [Icon(Icons.health_and_safety, color: Colors.white), SizedBox(width: 10), Text("Clinical Hub", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18))]),
+        title: const Text("Clinical Dashboard", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
         actions: [
-          Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.end, children: [
-            Text(fullName, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
-            const Text("Online", style: TextStyle(color: Colors.greenAccent, fontSize: 9)),
-          ]),
-          const SizedBox(width: 20),
+          Center(child: Padding(
+            padding: const EdgeInsets.only(right: 20),
+            child: Text(fullName, style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.bold)),
+          )),
         ],
       ),
       body: _isLoading 
         ? const Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70)))
         : RefreshIndicator(
-          onRefresh: () async => _setupClinicalSync(),
-          child: SingleChildScrollView(
-            physics: const AlwaysScrollableScrollPhysics(),
-            padding: const EdgeInsets.all(25),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text("Oversight Dashboard", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
-                const SizedBox(height: 25),
+            onRefresh: () async => _setupClinicalSync(),
+            child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.all(25),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("Registry Performance", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
+                  const SizedBox(height: 20),
 
-                // Statistics Row
-                _buildStatCard("Total Patients", _totalPatients.toString(), Icons.groups, Colors.blue),
-                const SizedBox(height: 15),
-                _buildStatCard("At-Risk Patients", _atRiskPatients.toString(), Icons.priority_high, Colors.red, badgeCount: _atRiskPatients > 0 ? _atRiskPatients.toString() : null),
-                const SizedBox(height: 15),
-                _buildStatCard("Daily Avg. Adherence", _avgAdherence, Icons.donut_large, Colors.green),
+                  // Updated Stats Cards
+                  Row(children: [
+                    Expanded(child: _buildStatCard("Patients", _totalPatients.toString(), Icons.groups, Colors.blue)),
+                    const SizedBox(width: 12),
+                    Expanded(child: _buildStatCard("At-Risk", _atRiskPatients.toString(), Icons.warning_amber_rounded, Colors.red)),
+                    const SizedBox(width: 12),
+                    Expanded(child: _buildStatCard("Daily Adh.", _avgAdherence, Icons.analytics, Colors.green)),
+                  ]),
 
-                const SizedBox(height: 35),
-                const Text("Priority Clinical Alerts", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.black87)),
-                const SizedBox(height: 15),
+                  const SizedBox(height: 35),
+                  const Text("Real-Time Activity Feed", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const Text("Monitoring per-dose logs across the registry", style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  const SizedBox(height: 15),
 
-                if (_criticalAlerts.isEmpty)
-                  _buildNoAlertsState()
-                else
-                  ..._criticalAlerts.take(5).map((alert) => _buildAlertTile(alert['msg'], alert['sub'], alert['icon'], alert['color'])),
+                  if (_clinicalActivityFeed.isEmpty)
+                    const Center(child: Padding(
+                      padding: EdgeInsets.only(top: 50),
+                      child: Text("No medication activity recorded today.", style: TextStyle(color: Colors.grey, fontSize: 13)),
+                    ))
+                  else
+                    ..._clinicalActivityFeed.take(25).map((activity) => _buildActivityCard(activity)),
 
-                const SizedBox(height: 30),
-                SizedBox(
-                  width: double.infinity, height: 55,
-                  child: OutlinedButton.icon(
-                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => HealthcareLinked(userEmail: widget.userEmail))),
-                    icon: const Icon(Icons.list_alt),
-                    label: const Text("View Patient Registry", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: const Color(0xFF1A3B70),
-                      side: const BorderSide(color: Color(0xFF1A3B70), width: 1.5),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 40),
-              ],
+                  const SizedBox(height: 30),
+                  _buildRegistryButton(),
+                  const SizedBox(height: 40),
+                ],
+              ),
             ),
           ),
-        ),
       bottomNavigationBar: CustomBottomNavBar(currentIndex: 0, role: "Healthcare\nProvider", userEmail: widget.userEmail),
     );
   }
 
-  Widget _buildStatCard(String title, String value, IconData icon, Color color, {String? badgeCount}) {
+  Widget _buildStatCard(String title, String value, IconData icon, Color color) {
     return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(15), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 10, offset: const Offset(0, 4))]),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title, style: TextStyle(color: Colors.grey[600], fontSize: 13, fontWeight: FontWeight.w500)),
-            const SizedBox(height: 5),
-            Text(value, style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
-          ]),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(12)),
-            child: badgeCount != null 
-              ? Badge(label: Text(badgeCount), child: Icon(icon, color: color, size: 28))
-              : Icon(icon, color: color, size: 28),
-          )
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAlertTile(String title, String sub, IconData icon, Color color) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: color.withOpacity(0.2))),
-      child: Row(
-        children: [
-          Icon(icon, color: color, size: 24),
-          const SizedBox(width: 15),
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-            Text(sub, style: const TextStyle(color: Colors.black54, fontSize: 11)),
-          ])),
-          Icon(Icons.chevron_right, color: Colors.grey.shade400, size: 16),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildNoAlertsState() {
-    return Container(
-      width: double.infinity, padding: const EdgeInsets.all(30),
-      decoration: BoxDecoration(color: Colors.green.withOpacity(0.05), borderRadius: BorderRadius.circular(15), border: Border.all(color: Colors.green.withOpacity(0.1))),
-      child: const Column(children: [
-        Icon(Icons.check_circle_outline, color: Colors.green, size: 40),
-        SizedBox(height: 10),
-        Text("No immediate clinical risks detected today.", style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold, fontSize: 13)),
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.grey.shade100)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Icon(icon, color: color, size: 20),
+        const SizedBox(height: 8),
+        Text(value, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+        Text(title, style: TextStyle(color: Colors.grey[600], fontSize: 9, fontWeight: FontWeight.bold)),
       ]),
+    );
+  }
+
+  Widget _buildActivityCard(Map<String, dynamic> act) {
+    bool isUrgent = act['color'] == Colors.red;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12), 
+        side: BorderSide(color: isUrgent ? Colors.red.shade100 : Colors.grey.shade100, width: isUrgent ? 2 : 1)
+      ),
+      child: ListTile(
+        leading: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(color: act['color'].withOpacity(0.1), shape: BoxShape.circle),
+          child: Icon(act['icon'], color: act['color'], size: 20),
+        ),
+        title: Text(act['msg'], style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: isUrgent ? Colors.red.shade900 : Colors.black)), 
+        subtitle: Text(act['sub'], style: const TextStyle(fontSize: 11, color: Colors.black54)),
+        trailing: const Icon(Icons.chevron_right, size: 16, color: Colors.grey),
+        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (context) => HealthcarePrescription(userEmail: widget.userEmail, initialTargetEmail: act['patientEmail']))),
+      ),
+    );
+  }
+
+  Widget _buildRegistryButton() {
+    return SizedBox(
+      width: double.infinity, height: 55,
+      child: ElevatedButton.icon(
+        onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => HealthcareLinked(userEmail: widget.userEmail))),
+        icon: const Icon(Icons.manage_accounts_outlined, color: Colors.white),
+        label: const Text("View Full Patient Registry", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A3B70), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+      ),
     );
   }
 }

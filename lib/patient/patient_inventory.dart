@@ -21,7 +21,7 @@ class _PatientInventoryState extends State<PatientInventory> {
     _fetchMachineId();
   }
 
-  // --- STEP 1: FIND LINKED HARDWARE ---
+  // --- DATABASE: FIND THE HARDWARE LINKED TO THIS ACCOUNT ---
   Future<void> _fetchMachineId() async {
     try {
       var userSnap = await FirebaseFirestore.instance
@@ -30,30 +30,30 @@ class _PatientInventoryState extends State<PatientInventory> {
           .limit(1)
           .get();
 
-      if (userSnap.docs.isNotEmpty) {
+      if (userSnap.docs.isNotEmpty && mounted) {
         setState(() {
           _linkedMachineId = userSnap.docs.first.get('linkedMachineId');
           _isInitializing = false;
         });
       } else {
-        setState(() => _isInitializing = false);
+        if (mounted) setState(() => _isInitializing = false);
       }
     } catch (e) {
-      debugPrint("Inventory Init Error: $e");
+      debugPrint("Inventory Fetch Error: $e");
       if (mounted) setState(() => _isInitializing = false);
     }
   }
 
-  // --- STEP 2: REFILL LOGIC (PERSISTENT ADHERENCE) ---
+  // --- HARDWARE LOGIC: RE-LOCK BIN AFTER MANUAL REFILL ---
   Future<void> _handleRefill(int index, List<dynamic> allSlots) async {
     if (_linkedMachineId == null) return;
 
     try {
-      // Logic: Mark the bin as physically FULL and engage the lock
-      // We do NOT clear 'lastTakenDate' so history remains intact
-      allSlots[index]['isDone'] = false;   // Reset for next scheduled alarm
-      allSlots[index]['isLocked'] = true;  // Remote command to lock physical solenoid
-
+      // Logic: Mark bin as NOT DONE (meaning it is now full) and engage solenoid lock
+      allSlots[index]['isDone'] = false;   // The "Done/Empty" state is reset
+      allSlots[index]['isLocked'] = true;  // The physical hardware is locked
+      
+      // Update the specific slot in the machines collection
       await FirebaseFirestore.instance
           .collection('machines')
           .doc(_linkedMachineId)
@@ -62,13 +62,13 @@ class _PatientInventoryState extends State<PatientInventory> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text("Bin ${allSlots[index]['slot']} physically locked. Ready for next dose."),
+            content: Text("${allSlots[index]['medDetails']} bin refilled and secured."),
             backgroundColor: Colors.teal,
           ),
         );
       }
     } catch (e) {
-      debugPrint("Refill error: $e");
+      debugPrint("Refill update error: $e");
     }
   }
 
@@ -81,32 +81,32 @@ class _PatientInventoryState extends State<PatientInventory> {
           icon: const Icon(Icons.arrow_back_ios, color: Colors.black, size: 20),
           onPressed: () => Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => PatientDashboard(userEmail: widget.userEmail))),
         ),
-        title: const Text("Hardware Inventory", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)),
+        title: const Text("My Medication Bins", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)),
         backgroundColor: Colors.white, elevation: 0.5, centerTitle: true,
       ),
       body: _isInitializing
           ? const Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70)))
           : _linkedMachineId == null
-              ? _buildEmptyState("Please link a machine in Settings to manage your bins.")
+              ? _buildEmptyState("Please link your dispenser hub in Settings.")
               : StreamBuilder<DocumentSnapshot>(
                   stream: FirebaseFirestore.instance.collection('machines').doc(_linkedMachineId).snapshots(),
                   builder: (context, snapshot) {
                     if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
-                    if (!snapshot.hasData || !snapshot.data!.exists) return _buildEmptyState("Machine data not found.");
+                    if (!snapshot.hasData || !snapshot.data!.exists) return _buildEmptyState("Hardware data unreachable.");
 
                     var data = snapshot.data!.data() as Map<String, dynamic>;
-                    List<dynamic> allSlots = data['slots'] ?? [];
+                    List<dynamic> allSlots = List.from(data['slots'] ?? []);
                     final String myEmail = widget.userEmail.trim().toLowerCase();
 
-                    // Filter: Locate indices of slots assigned to THIS patient in the shared machine
+                    // Filter: Locate slots assigned to THIS patient
                     List<int> mySlotIndices = [];
                     for (int i = 0; i < allSlots.length; i++) {
-                      if (allSlots[i]['patientEmail'] == myEmail && allSlots[i]['status'] == "Occupied") {
+                      if (allSlots[i]['patientEmail'].toString().toLowerCase().trim() == myEmail && allSlots[i]['status'] == "Occupied") {
                         mySlotIndices.add(i);
                       }
                     }
 
-                    if (mySlotIndices.isEmpty) return _buildEmptyState("You currently have no physical bins assigned.");
+                    if (mySlotIndices.isEmpty) return _buildEmptyState("You have no active physical bins assigned.");
 
                     return ListView.builder(
                       padding: const EdgeInsets.all(20),
@@ -114,14 +114,16 @@ class _PatientInventoryState extends State<PatientInventory> {
                       itemBuilder: (context, index) {
                         int slotIdx = mySlotIndices[index];
                         var slot = allSlots[slotIdx];
-                        bool isBinEmpty = slot['isDone'] == true; // Hardware-specific "Empty" status
+                        
+                        // KEY LOGIC: isDone == true means the pill was taken (Bin is Empty)
+                        bool needsRefill = (slot['isDone'] == true);
 
                         return Padding(
                           padding: const EdgeInsets.only(bottom: 20),
                           child: InventoryCard(
                             medName: slot['medDetails'] ?? "Medication",
                             slotNumber: slot['slot'].toString(),
-                            isBinEmpty: isBinEmpty,
+                            isBinEmpty: needsRefill, // Passing the "needs refill" state
                             onRefill: () => _handleRefill(slotIdx, allSlots),
                           ),
                         );
@@ -142,7 +144,7 @@ class _PatientInventoryState extends State<PatientInventory> {
           children: [
             Icon(Icons.inventory_2_outlined, size: 50, color: Colors.blue.withOpacity(0.2)),
             const SizedBox(height: 15),
-            Text(msg, textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey, fontSize: 13)),
+            Text(msg, textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey, fontSize: 13, height: 1.5)),
           ],
         )
       )
@@ -165,7 +167,7 @@ class InventoryCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: Colors.white, 
         borderRadius: BorderRadius.circular(15),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 4))]
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 10, offset: const Offset(0, 4))]
       ),
       child: Column(
         children: [
@@ -174,24 +176,24 @@ class InventoryCard extends StatelessWidget {
               Container(
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                  color: isBinEmpty ? Colors.red.withOpacity(0.1) : Colors.green.withOpacity(0.1),
+                  color: isBinEmpty ? Colors.orange.withOpacity(0.1) : Colors.green.withOpacity(0.1),
                   shape: BoxShape.circle,
                 ),
-                child: Icon(isBinEmpty ? Icons.shopping_basket_outlined : Icons.check_circle_outline, 
-                    color: isBinEmpty ? Colors.red : Colors.green, size: 24),
+                child: Icon(isBinEmpty ? Icons.shopping_basket_outlined : Icons.lock_clock_outlined, 
+                    color: isBinEmpty ? Colors.orange : Colors.green, size: 24),
               ),
               const SizedBox(width: 15),
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Text(medName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFF1A3B70))),
-                  Text("Physical Slot: $slotNumber", style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                  Text("Dispenser Slot: $slotNumber", style: const TextStyle(color: Colors.grey, fontSize: 12)),
                 ]),
               ),
             ],
           ),
           const SizedBox(height: 20),
-          const Divider(),
-          const SizedBox(height: 10),
+          const Divider(height: 1, thickness: 0.5),
+          const SizedBox(height: 20),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -199,15 +201,17 @@ class InventoryCard extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text("HARDWARE STATUS", style: TextStyle(color: Colors.grey, fontSize: 10, fontWeight: FontWeight.bold)),
-                  Text(isBinEmpty ? "EMPTY (UNLOCKED)" : "FULL (LOCKED)", 
-                      style: TextStyle(fontWeight: FontWeight.bold, color: isBinEmpty ? Colors.red : Colors.green, fontSize: 12)),
+                  const SizedBox(height: 4),
+                  Text(isBinEmpty ? "AWAITING REFILL" : "LOCKED & SECURED", 
+                      style: TextStyle(fontWeight: FontWeight.bold, color: isBinEmpty ? Colors.orange : Colors.green, fontSize: 12)),
                 ],
               ),
+              // ONLY show the refill button if the bin is empty (isDone == true)
               if (isBinEmpty)
                 ElevatedButton.icon(
                   onPressed: onRefill,
-                  icon: const Icon(Icons.lock_reset, size: 14, color: Colors.white),
-                  label: const Text("Refilled bin", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+                  icon: const Icon(Icons.refresh, size: 14, color: Colors.white),
+                  label: const Text("Mark as Refilled", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF1A3B70), 
                     elevation: 0,
