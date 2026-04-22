@@ -29,28 +29,44 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
   }
 
   // --- LOGIC: PER-DOSE ADHERENCE SYNC ---
-// REPLACE the _setupClinicalSync method in HealthcareDashboard with this version:
-
   void _setupClinicalSync() {
     final String clinicalEmail = widget.userEmail.trim().toLowerCase();
     final DateTime now = DateTime.now();
     final String todayStr = DateFormat('yyyy-MM-dd').format(now);
 
-    FirebaseFirestore.instance.collection('users').where('email', isEqualTo: clinicalEmail).limit(1).snapshots().listen((snap) {
-      if (snap.docs.isNotEmpty && mounted) setState(() => fullName = snap.docs.first.get('name') ?? "Provider");
+    // 1. Fetch Provider Profile Name
+    FirebaseFirestore.instance
+        .collection('users')
+        .where('email', isEqualTo: clinicalEmail)
+        .limit(1)
+        .snapshots()
+        .listen((snap) {
+      if (snap.docs.isNotEmpty && mounted) {
+        setState(() => fullName = snap.docs.first.get('name') ?? "Provider");
+      }
     });
 
-    FirebaseFirestore.instance.collection('connections').where('healthcareEmail', isEqualTo: clinicalEmail).snapshots().listen((connectionSnap) async {
+    // 2. Listen to Connections then Adherence Logs
+    FirebaseFirestore.instance
+        .collection('connections')
+        .where('healthcareEmail', isEqualTo: clinicalEmail)
+        .snapshots()
+        .listen((connectionSnap) async {
+      
       List<String> patientEmails = connectionSnap.docs.map((d) => d.get('patientEmail').toString().toLowerCase().trim()).toList();
+      
       if (patientEmails.isEmpty) {
         if (mounted) setState(() { _isLoading = false; _totalPatients = 0; _clinicalActivityFeed = []; });
         return;
       }
 
-      FirebaseFirestore.instance.collection('adherence_logs')
+      // Query granular logs for all linked patients for TODAY
+      FirebaseFirestore.instance
+          .collection('adherence_logs')
           .where('patientEmail', whereIn: patientEmails)
           .where('date', isEqualTo: todayStr)
-          .snapshots().listen((logSnap) {
+          .snapshots()
+          .listen((logSnap) {
         
         int totalScheduled = logSnap.docs.length;
         int totalTaken = 0;
@@ -63,55 +79,76 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
 
           String status = (data['adherenceStatus'] ?? "Upcoming").toString().toLowerCase().trim();
           String med = data['medName'] ?? data['medDetails'] ?? "Medication";
-          String schedT = (data['times'] as List).isNotEmpty ? (data['times'] as List).first : "--:--";
+          String schedT = (data['times'] is List && (data['times'] as List).isNotEmpty) ? (data['times'] as List).first : "--:--";
           String takenT = data['takenTime'] ?? data['lastTakenTime'] ?? "";
           String pName = data['patientName'] ?? "Patient";
+          String pEmail = data['patientEmail'] ?? "";
 
-          Color color; IconData icon; String msg;
+          Color color;
+          IconData icon;
+          String msg;
+          String sub;
 
+          // --- STATUS CLASSIFICATION (Mirrors Caregiver Logic) ---
           if (status == "taken") {
-            totalTaken++; color = Colors.green; icon = Icons.check_circle;
-            msg = "$pName: Dose Taken";
+            totalTaken++;
+            color = Colors.green;
+            icon = Icons.check_circle;
+            msg = "$pName took $med";
+            sub = "Confirmed on time at $takenT";
           } else if (status == "late") {
-            totalTaken++; color = Colors.orange; icon = Icons.priority_high;
-            msg = "$pName: LATE Intake";
+            totalTaken++;
+            color = Colors.orange;
+            icon = Icons.priority_high;
+            msg = "$pName took $med late";
+            sub = "Taken at $takenT (Scheduled: $schedT)";
           } else {
+            // Check if Upcoming has timed out (schedule + 30 mins)
             bool isActuallyMissed = false;
             try {
               DateTime st = DateFormat("hh:mm a").parse(schedT);
               DateTime fullS = DateTime(now.year, now.month, now.day, st.hour, st.minute);
-              if (now.isAfter(fullS.add(const Duration(minutes: 30)))) isActuallyMissed = true;
+              if (now.isAfter(fullS.add(const Duration(minutes: 30)))) {
+                isActuallyMissed = true;
+              }
             } catch (e) {}
 
             if (isActuallyMissed || status == "missed") {
-              atRiskEmails.add(data['patientEmail']);
-              color = Colors.red; icon = Icons.error_outline;
-              msg = "$pName: MISSED Dose";
+              atRiskEmails.add(pEmail);
+              color = Colors.red;
+              icon = Icons.error_outline;
+              msg = "MISSED: $pName - $med";
+              sub = "Failed to take dose scheduled for $schedT";
             } else {
-              color = Colors.blueGrey; icon = Icons.watch_later_outlined;
-              msg = "$pName: Upcoming";
+              color = Colors.blueGrey;
+              icon = Icons.watch_later_outlined;
+              msg = "Upcoming: $pName - $med";
+              sub = "Scheduled for today at $schedT";
             }
           }
 
           feed.add({
-            "patientEmail": data['patientEmail'],
+            "patientEmail": pEmail,
             "msg": msg,
-            "sub": "$med | Sched: $schedT ${status == 'upcoming' ? '' : '| Action: ' + takenT}",
+            "sub": sub,
             "color": color,
             "icon": icon,
             "timestamp": (data['timestamp'] as Timestamp?)?.toDate() ?? now,
           });
         }
 
+        // Sort feed by most recent activity/schedule
         feed.sort((a, b) => b['timestamp'].compareTo(a['timestamp']));
 
-        if (mounted) setState(() {
-          _totalPatients = patientEmails.length;
-          _atRiskPatients = atRiskEmails.length;
-          _avgAdherence = totalScheduled > 0 ? "${((totalTaken / totalScheduled) * 100).toStringAsFixed(0)}%" : "0%";
-          _clinicalActivityFeed = feed;
-          _isLoading = false;
-        });
+        if (mounted) {
+          setState(() {
+            _totalPatients = patientEmails.length;
+            _atRiskPatients = atRiskEmails.length;
+            _avgAdherence = totalScheduled > 0 ? "${((totalTaken / totalScheduled) * 100).toStringAsFixed(0)}%" : "0%";
+            _clinicalActivityFeed = feed;
+            _isLoading = false;
+          });
+        }
       });
     });
   }
@@ -147,7 +184,6 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
                   const Text("Registry Performance", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
                   const SizedBox(height: 20),
 
-                  // Updated Stats Cards
                   Row(children: [
                     Expanded(child: _buildStatCard("Patients", _totalPatients.toString(), Icons.groups, Colors.blue)),
                     const SizedBox(width: 12),

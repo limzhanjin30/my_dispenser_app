@@ -28,7 +28,7 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
   List<String> _currentMedTimes = [];
   int _selectedIndex = 0; 
   String? _currentTargetEmail;
-  String? _currentTargetName; // --- PATIENT NAME VARIABLE ---
+  String? _currentTargetName; 
   String? _currentTargetMachineId; 
   bool _isLoading = false;
   List<Map<String, dynamic>> _machineSlots = []; 
@@ -53,7 +53,7 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
           .where('email', isEqualTo: pEmail.trim().toLowerCase()).limit(1).get();
       if (userDoc.docs.isNotEmpty) {
         var userData = userDoc.docs.first.data();
-        _currentTargetName = userData['name']; // --- FETCH PATIENT NAME ---
+        _currentTargetName = userData['name']; 
         String? machineId = userData['linkedMachineId']; 
         if (machineId != null && machineId.isNotEmpty) {
           _currentTargetMachineId = machineId;
@@ -98,7 +98,6 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
     });
   }
 
-  // --- LOGIC: RESET SLOT (Wipes all associated daily & time logs) ---
   Future<void> _clearSlot({int? index}) async {
     if (_currentTargetMachineId == null || _currentTargetEmail == null) return;
     int targetIdx = index ?? _selectedIndex;
@@ -107,15 +106,17 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
     try {
       final String pEmail = _currentTargetEmail!.trim().toLowerCase();
       final int slotNum = targetIdx + 1;
+      final String todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
 
-      var existingLogs = await FirebaseFirestore.instance.collection('adherence_logs')
+      // Only terminate logs from today onwards
+      var logsToArchive = await FirebaseFirestore.instance.collection('adherence_logs')
           .where('patientEmail', isEqualTo: pEmail)
           .where('slot', isEqualTo: slotNum)
-          .where('status', isEqualTo: "Occupied")
+          .where('date', isGreaterThanOrEqualTo: todayStr)
           .get();
 
       WriteBatch batch = FirebaseFirestore.instance.batch();
-      for (var doc in existingLogs.docs) {
+      for (var doc in logsToArchive.docs) {
         batch.update(doc.reference, {
           "finalStatus": "Course Terminated",
           "status": "Archived",
@@ -125,18 +126,16 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
       }
       await batch.commit();
 
-      // Wipe the machine slot
       _machineSlots[targetIdx] = {
         "slot": slotNum, "status": "Empty", "patientEmail": "", 
-        "patientName": "", // --- RESET NAME ---
-        "medDetails": "",
+        "patientName": "", "medDetails": "",
         "times": [], "mealCondition": "After Meal", "frequency": "Everyday",
         "startDate": "", "endDate": "", "isLocked": false, "isDone": false,
         "adherenceStatus": "Upcoming", "lastTakenDate": "", "lastTakenTime": "",
       };
 
       await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).update({"slots": _machineSlots});
-      _showMsg("Slot cleared. History Terminated.", Colors.blueGrey);
+      _showMsg("Future logs cleared. History preserved.", Colors.blueGrey);
     } catch (e) {
       _showMsg("Reset Error: $e", Colors.red);
     } finally {
@@ -144,7 +143,7 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
     }
   }
 
-  // --- LOGIC: SAVE/SYNC ---
+  // --- REVISED SAVE LOGIC: DELETE FROM TODAY ONWARDS & RECREATE ---
   Future<void> _saveChanges() async {
     if (_currentTargetMachineId == null || _currentTargetEmail == null) return;
     if (_medDetailsController.text.trim().isEmpty || _currentMedTimes.isEmpty) {
@@ -154,32 +153,30 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
     setState(() => _isLoading = true);
     final String pEmail = _currentTargetEmail!.trim().toLowerCase();
     final int slotNum = _selectedIndex + 1;
+    final DateTime now = DateTime.now();
+    final DateTime todayMidnight = DateTime(now.year, now.month, now.day);
+    final String todayStr = DateFormat('yyyy-MM-dd').format(todayMidnight);
 
     try {
-      var existingLogs = await FirebaseFirestore.instance.collection('adherence_logs')
+      // 1. DELETE EXISTING LOGS FROM TODAY ONWARDS ONLY
+      var logsToDelete = await FirebaseFirestore.instance.collection('adherence_logs')
           .where('patientEmail', isEqualTo: pEmail)
           .where('slot', isEqualTo: slotNum)
-          .where('status', isEqualTo: "Occupied")
+          .where('date', isGreaterThanOrEqualTo: todayStr)
           .get();
 
       WriteBatch batch = FirebaseFirestore.instance.batch();
+      for (var doc in logsToDelete.docs) {
+        batch.delete(doc.reference);
+      }
 
-      if (existingLogs.docs.isNotEmpty) {
-        // --- ACTION: UPDATE EVERY EXISTING DAILY LOG ---
-        for (var doc in existingLogs.docs) {
-          batch.update(doc.reference, {
-            "medDetails": _medDetailsController.text.trim(),
-            "mealCondition": _selectedMealCondition,
-            "patientName": _currentTargetName ?? "Patient", // --- UPDATE NAME ---
-            "recordType": "Caregiver Update",
-            "timestamp": FieldValue.serverTimestamp(),
-          });
-        }
-      } else {
-        // --- ACTION: CREATE NEW LOGS ---
-        int totalDays = _endDate.difference(_startDate).inDays + 1;
+      // 2. RECREATE NEW LOGS (From today or start date, whichever is later)
+      DateTime startPoint = _startDate.isBefore(todayMidnight) ? todayMidnight : _startDate;
+      int totalDays = _endDate.difference(startPoint).inDays + 1;
+
+      if (totalDays > 0) {
         for (int d = 0; d < totalDays; d++) {
-          DateTime logDate = _startDate.add(Duration(days: d));
+          DateTime logDate = startPoint.add(Duration(days: d));
           String logDateStr = DateFormat('yyyy-MM-dd').format(logDate);
           
           for (String timeSlot in _currentMedTimes) {
@@ -196,8 +193,8 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
               "mealCondition": _selectedMealCondition,
               "medDetails": _medDetailsController.text.trim(),
               "patientEmail": pEmail,
-              "patientName": _currentTargetName ?? "Patient", // --- SAVE NAME ---
-              "recordType": "Caregiver Setup",
+              "patientName": _currentTargetName ?? "Patient",
+              "recordType": "Caregiver Re-Sync",
               "slot": slotNum,
               "status": "Occupied",
               "times": [timeSlot], 
@@ -209,16 +206,12 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
       
       await batch.commit();
 
-      // UPDATE MACHINE HARDWARE STATE
+      // 3. UPDATE MACHINE HARDWARE STATE
       _machineSlots[_selectedIndex] = {
-        "slot": slotNum,
-        "status": "Occupied",
-        "patientEmail": pEmail,
-        "patientName": _currentTargetName ?? "Patient", // --- SYNC NAME TO MACHINE ---
-        "medDetails": _medDetailsController.text.trim(),
-        "times": _currentMedTimes,
-        "mealCondition": _selectedMealCondition,
-        "frequency": "Everyday",
+        "slot": slotNum, "status": "Occupied", "patientEmail": pEmail,
+        "patientName": _currentTargetName ?? "Patient",
+        "medDetails": _medDetailsController.text.trim(), "times": _currentMedTimes,
+        "mealCondition": _selectedMealCondition, "frequency": "Everyday",
         "startDate": DateFormat('yyyy-MM-dd').format(_startDate),
         "endDate": DateFormat('yyyy-MM-dd').format(_endDate),
         "isLocked": true, "isDone": false,
@@ -227,7 +220,7 @@ class _CaregiverScheduleEditorState extends State<CaregiverScheduleEditor> {
       };
 
       await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).update({"slots": _machineSlots});
-      _showMsg("Sync Successful. Name and logs updated.", Colors.teal);
+      _showMsg("Update successful. History preserved.", Colors.teal);
     } catch (e) {
       _showMsg("Sync Error: $e", Colors.red);
     } finally {

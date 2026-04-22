@@ -40,7 +40,6 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
     if (_currentTargetEmail != null) { _fetchPatientMachineInfo(_currentTargetEmail!); }
   }
 
-  // --- DATABASE FETCH: CLINICAL CONNECTIONS ---
   Stream<QuerySnapshot> _getLinkedPatientsStream() {
     return FirebaseFirestore.instance.collection('connections')
         .where('healthcareEmail', isEqualTo: widget.userEmail.trim().toLowerCase()).snapshots();
@@ -99,7 +98,7 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
     });
   }
 
-  // --- LOGIC: FINISH COURSE (Batch terminates all future logs) ---
+  // --- LOGIC: FINISH COURSE (Only archives logs from today onwards) ---
   Future<void> _clearSlot({int? index}) async {
     if (_currentTargetMachineId == null || _currentTargetEmail == null) return;
     int targetIdx = index ?? _selectedIndex;
@@ -108,16 +107,16 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
     try {
       final String pEmail = _currentTargetEmail!.trim().toLowerCase();
       final int slotNum = targetIdx + 1;
+      final String todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
 
-      // Find any logs for this bin that are still 'Occupied'
-      var existingLogs = await FirebaseFirestore.instance.collection('adherence_logs')
+      var futureLogs = await FirebaseFirestore.instance.collection('adherence_logs')
           .where('patientEmail', isEqualTo: pEmail)
           .where('slot', isEqualTo: slotNum)
-          .where('status', isEqualTo: "Occupied")
+          .where('date', isGreaterThanOrEqualTo: todayStr)
           .get();
 
       WriteBatch batch = FirebaseFirestore.instance.batch();
-      for (var doc in existingLogs.docs) {
+      for (var doc in futureLogs.docs) {
         batch.update(doc.reference, {
           "finalStatus": "Course Terminated",
           "status": "Archived",
@@ -135,7 +134,7 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
       };
 
       await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).update({"slots": _machineSlots});
-      _showMsg("Slot cleared. Prescription records terminated.", Colors.blueGrey);
+      _showMsg("Course stopped. Future logs archived.", Colors.blueGrey);
     } catch (e) {
       _showMsg("Reset Error: $e", Colors.red);
     } finally {
@@ -143,60 +142,56 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
     }
   }
 
-  // --- LOGIC: SAVE/SYNC (Creates/Updates individual dose logs with patientName) ---
+  // --- LOGIC: SAVE/SYNC (Delete from today onwards and recreate) ---
   Future<void> _saveChanges() async {
     if (_currentTargetMachineId == null || _currentTargetEmail == null) return;
     if (_medDetailsController.text.trim().isEmpty || _currentMedTimes.isEmpty) {
-      _showMsg("Prescription name and timing required.", Colors.orange); return;
+      _showMsg("Clinical instructions and timings required.", Colors.orange); return;
     }
 
     setState(() => _isLoading = true);
     final String pEmail = _currentTargetEmail!.trim().toLowerCase();
     final int slotNum = _selectedIndex + 1;
+    final DateTime now = DateTime.now();
+    final DateTime todayMidnight = DateTime(now.year, now.month, now.day);
+    final String todayStr = DateFormat('yyyy-MM-dd').format(todayMidnight);
 
     try {
-      var existingLogs = await FirebaseFirestore.instance.collection('adherence_logs')
+      // 1. DELETE FUTURE 'UPCOMING' LOGS (Starting from today)
+      var logsToDelete = await FirebaseFirestore.instance.collection('adherence_logs')
           .where('patientEmail', isEqualTo: pEmail)
           .where('slot', isEqualTo: slotNum)
-          .where('status', isEqualTo: "Occupied")
+          .where('date', isGreaterThanOrEqualTo: todayStr)
           .get();
 
       WriteBatch batch = FirebaseFirestore.instance.batch();
+      for (var doc in logsToDelete.docs) {
+        batch.delete(doc.reference);
+      }
 
-      if (existingLogs.docs.isNotEmpty) {
-        // --- ACTION: UPDATE EXISTING (Regardless of creator) ---
-        for (var doc in existingLogs.docs) {
-          batch.update(doc.reference, {
-            "medDetails": _medDetailsController.text.trim(),
-            "mealCondition": _selectedMealCondition,
-            "patientName": _currentTargetName ?? "Patient",
-            "recordType": "Healthcare Update",
-            "timestamp": FieldValue.serverTimestamp(),
-          });
-        }
-      } else {
-        // --- ACTION: CREATE ONE LOG PER DAY AND PER TIME SLOT ---
-        int totalDays = _endDate.difference(_startDate).inDays + 1;
+      // 2. RECREATE NEW LOGS (From today or chosen start date, whichever is later)
+      DateTime startPoint = _startDate.isBefore(todayMidnight) ? todayMidnight : _startDate;
+      int totalDays = _endDate.difference(startPoint).inDays + 1;
+
+      if (totalDays > 0) {
         for (int d = 0; d < totalDays; d++) {
-          DateTime logDate = _startDate.add(Duration(days: d));
-          String logDateStr = DateFormat('yyyy-MM-dd').format(logDate);
-          
+          String logDateStr = DateFormat('yyyy-MM-dd').format(startPoint.add(Duration(days: d)));
           for (String timeSlot in _currentMedTimes) {
             DocumentReference newLogRef = FirebaseFirestore.instance.collection('adherence_logs').doc();
             batch.set(newLogRef, {
               "adherenceStatus": "Upcoming",
               "archivedBy": widget.userEmail,
               "date": logDateStr,
-              "finalStatus": "Course Active",
+              "finalStatus": "Clinical Course Active",
               "frequency": "Everyday",
               "isDone": false,
               "isLocked": true,
               "lastTakenTime": "",
-              "medDetails": _medDetailsController.text.trim(),
               "mealCondition": _selectedMealCondition,
+              "medDetails": _medDetailsController.text.trim(),
               "patientEmail": pEmail,
               "patientName": _currentTargetName ?? "Patient",
-              "recordType": "Healthcare Setup",
+              "recordType": "Healthcare Re-Sync",
               "slot": slotNum,
               "status": "Occupied",
               "times": [timeSlot], 
@@ -208,7 +203,7 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
       
       await batch.commit();
 
-      // Update machine hardware state
+      // 3. Update physical hardware hub
       _machineSlots[_selectedIndex] = {
         "slot": slotNum, "status": "Occupied", "patientEmail": pEmail,
         "patientName": _currentTargetName ?? "Patient",
@@ -221,7 +216,7 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
       };
 
       await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).update({"slots": _machineSlots});
-      _showMsg("Success. Clinical prescription synced.", Colors.teal);
+      _showMsg("Prescription updated. History preserved.", Colors.teal);
     } catch (e) {
       _showMsg("Sync Error: $e", Colors.red);
     } finally {
@@ -240,13 +235,13 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
           icon: const Icon(Icons.arrow_back_ios, color: Color(0xFF1A3B70), size: 20), 
           onPressed: () => Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => HealthcareDashboard(userEmail: widget.userEmail)))
         ),
-        title: const Text("Clinical Prescriber", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)), 
+        title: const Text("Prescription Manager", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 16)), 
         backgroundColor: Colors.white, centerTitle: true, elevation: 0.5,
       ),
       body: StreamBuilder<QuerySnapshot>(
         stream: _getLinkedPatientsStream(),
         builder: (context, snapshot) {
-          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return const Center(child: Text("No linked patients in clinical registry."));
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return const Center(child: Text("No linked patients."));
           var pts = snapshot.data!.docs;
           return _isLoading ? const Center(child: CircularProgressIndicator()) : SingleChildScrollView(
             padding: const EdgeInsets.all(25),
