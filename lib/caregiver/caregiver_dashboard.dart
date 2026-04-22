@@ -64,10 +64,23 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           .where('patientEmail', whereIn: patientEmails)
           .where('date', isEqualTo: todayStr)
           .snapshots()
-          .listen((logSnap) {
+          .listen((logSnap) async {
             
         int urgentActions = 0;
         List<Map<String, dynamic>> activityItems = [];
+
+        // --- HARDWARE LOOKUP: Get bin statuses for all patients ---
+        Map<String, List<dynamic>> hardwareStates = {};
+        for (String pEmail in patientEmails) {
+          var uSnap = await FirebaseFirestore.instance.collection('users').where('email', isEqualTo: pEmail).limit(1).get();
+          if (uSnap.docs.isNotEmpty) {
+            String? mId = uSnap.docs.first.get('linkedMachineId');
+            if (mId != null) {
+              var mSnap = await FirebaseFirestore.instance.collection('machines').doc(mId).get();
+              if (mSnap.exists) hardwareStates[pEmail] = mSnap.get('slots') ?? [];
+            }
+          }
+        }
 
         for (var doc in logSnap.docs) {
           var data = doc.data();
@@ -79,25 +92,41 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           String takenAt = data['takenTime'] ?? data['lastTakenTime'] ?? "";
           String pEmail = data['patientEmail'] ?? "";
           String pName = data['patientName'] ?? "Patient";
+          int slotNum = data['slot'] ?? 0;
+
+          // Check if physical hardware bin for this slot is still "Done" (needs refill)
+          bool needsRefill = false;
+          if (hardwareStates.containsKey(pEmail)) {
+            var slots = hardwareStates[pEmail]!;
+            var physicalSlot = slots.firstWhere((s) => s['slot'] == slotNum, orElse: () => null);
+            if (physicalSlot != null && physicalSlot['isDone'] == true) {
+              needsRefill = true;
+            }
+          }
 
           Color itemColor;
           IconData itemIcon;
           String msg;
           String sub;
 
-          // --- FEED LOGIC: UPDATED TO MENTION PATIENT NAME IN EVERY STATUS ---
+          // --- FEED LOGIC: HANDLE LATE, TAKEN, MISSED, AND REFILL ---
           if (status == "taken") {
             itemColor = Colors.green;
             itemIcon = Icons.check_circle;
-            msg = "$pName took $med"; // Mentioned name
+            msg = "$pName took $med";
             sub = "Confirmed on time at $takenAt";
           } else if (status == "late") {
             itemColor = Colors.orange;
             itemIcon = Icons.priority_high;
-            msg = "$pName took $med late"; // Mentioned name
+            msg = "$pName took $med late";
             sub = "Taken at $takenAt (Scheduled: $schedTime)";
+          } else if (needsRefill && status == "upcoming") {
+            // NEW STATUS: NOT REFILLED
+            itemColor = Colors.deepPurple;
+            itemIcon = Icons.inventory_2;
+            msg = "NOT REFILLED: $pName - $med";
+            sub = "Slot $slotNum requires refill for today's intake";
           } else {
-            // Check if Upcoming has locally timed out (passed + 30 mins)
             bool isActuallyMissed = false;
             try {
               DateTime st = DateFormat("hh:mm a").parse(schedTime);
@@ -131,7 +160,7 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           });
         }
 
-        // Sort by Scheduled Time (Descending: Most recent at top)
+        // Sort by Scheduled Time
         activityItems.sort((a, b) => b['timeForSort'].compareTo(a['timeForSort']));
 
         if (mounted) {
@@ -186,7 +215,7 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
 
                   const SizedBox(height: 35),
                   const Text("Activity Feed", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  const Text("Real-time monitoring of scheduled doses", style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  const Text("Real-time monitoring of doses and hardware status", style: TextStyle(fontSize: 11, color: Colors.grey)),
                   const SizedBox(height: 15),
 
                   if (_machineActivityFeed.isEmpty)
@@ -223,12 +252,17 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
 
   Widget _buildActivityCard(Map<String, dynamic> act) {
     bool isUrgent = act['color'] == Colors.red;
+    bool isRefill = act['color'] == Colors.deepPurple;
+
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       elevation: 0,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(12), 
-        side: BorderSide(color: isUrgent ? Colors.red.shade100 : Colors.grey.shade100, width: isUrgent ? 2 : 1)
+        side: BorderSide(
+          color: isUrgent ? Colors.red.shade100 : (isRefill ? Colors.deepPurple.shade100 : Colors.grey.shade100), 
+          width: (isUrgent || isRefill) ? 2 : 1
+        )
       ),
       child: ListTile(
         leading: Container(
@@ -236,7 +270,7 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           decoration: BoxDecoration(color: act['color'].withOpacity(0.1), shape: BoxShape.circle),
           child: Icon(act['icon'], color: act['color'], size: 20),
         ),
-        title: Text(act['msg'], style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: isUrgent ? Colors.red.shade900 : Colors.black)), 
+        title: Text(act['msg'], style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: isUrgent ? Colors.red.shade900 : (isRefill ? Colors.deepPurple.shade900 : Colors.black))), 
         subtitle: Text(act['sub'], style: const TextStyle(fontSize: 11, color: Colors.black54)),
         trailing: const Icon(Icons.chevron_right, size: 16, color: Colors.grey),
         onTap: () => Navigator.push(context, MaterialPageRoute(builder: (context) => CaregiverScheduleEditor(userEmail: widget.userEmail, initialTargetEmail: act['patientEmail']))),

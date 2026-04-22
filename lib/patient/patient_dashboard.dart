@@ -120,6 +120,29 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     if (_selectedDose == null || linkedMachineId == null) return;
     
     final doseToLog = _selectedDose!;
+    
+    // 1. PHYSICAL HARDWARE CHECK: Is the bin actually refilled?
+    try {
+      DocumentSnapshot machineSnap = await FirebaseFirestore.instance
+          .collection('machines')
+          .doc(linkedMachineId)
+          .get();
+
+      if (machineSnap.exists) {
+        List<dynamic> slots = List.from(machineSnap.get('slots'));
+        var physicalSlot = slots.firstWhere((s) => s['slot'] == doseToLog['slot']);
+
+        // isDone == true means the bin was emptied previously and hasn't been refilled
+        if (physicalSlot['isDone'] == true) {
+          _showErrorSnackBar("Hardware Error: Bin ${doseToLog['slot']} has not been refilled yet!");
+          return; // STOP logic here
+        }
+      }
+    } catch (e) {
+      debugPrint("Refill Check Error: $e");
+    }
+
+    // 2. Proceed with PIN Verification if refill check passed
     bool isAuthorized = await _promptForDispenserPin();
     if (!isAuthorized) return;
 
@@ -132,7 +155,7 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     String finalStatus = isLate ? "Late" : "Taken";
 
     try {
-      // 1. UPDATE THE LOG FOR TODAY
+      // 3. UPDATE THE LOG FOR TODAY
       var logQuery = await FirebaseFirestore.instance
           .collection('adherence_logs')
           .where('patientEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
@@ -152,7 +175,7 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
         });
       }
 
-      // 2. NEW LOOK-AHEAD LOGIC: Check if there is medicine tomorrow
+      // 4. LOOK-AHEAD LOGIC: Check if there is medicine tomorrow
       var tomorrowLogs = await FirebaseFirestore.instance
           .collection('adherence_logs')
           .where('patientEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
@@ -163,7 +186,7 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
 
       bool hasDoseTomorrow = tomorrowLogs.docs.isNotEmpty;
 
-      // 3. UPDATE PHYSICAL MACHINE STATE
+      // 5. UPDATE PHYSICAL MACHINE STATE
       final String machineId = linkedMachineId!;
       DocumentSnapshot machineDoc = await FirebaseFirestore.instance.collection('machines').doc(machineId).get();
 
@@ -172,12 +195,10 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
         for (int i = 0; i < slots.length; i++) {
           if (slots[i]['slot'] == doseToLog['slot']) {
             if (hasDoseTomorrow) {
-              // CONTINUE COURSE: Show "Awaiting Refill" in Inventory
               slots[i]['isDone'] = true; 
               slots[i]['isLocked'] = false; 
               slots[i]['adherenceStatus'] = finalStatus;
             } else {
-              // FINISH COURSE: Set slot to Empty (removes from Inventory)
               slots[i]['status'] = "Empty";
               slots[i]['isDone'] = false;
               slots[i]['isLocked'] = false;
