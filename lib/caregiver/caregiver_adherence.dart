@@ -44,7 +44,7 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
           Expanded(
             child: _selectedPatientEmail == null 
               ? _buildEmptyState("Select a patient to audit their weekly adherence.")
-              : _buildWeeklyLogs(),
+              : _buildWeeklyLogsStream(),
           ),
         ],
       ),
@@ -65,8 +65,17 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
             value: _selectedPatientEmail,
             hint: const Text("Select Patient"),
             decoration: InputDecoration(labelText: "Clinical Monitoring", border: OutlineInputBorder(borderRadius: BorderRadius.circular(10))),
-            items: connections.map((c) => DropdownMenuItem(value: c.get('patientEmail').toString().toLowerCase().trim(), child: Text(c.get('patientEmail')))).toList(),
-            onChanged: (val) => setState(() => _selectedPatientEmail = val),
+            items: connections.map((c) {
+              String cleanEmail = c.get('patientEmail').toString().toLowerCase().trim();
+              return DropdownMenuItem(value: cleanEmail, child: Text(cleanEmail));
+            }).toList(),
+            onChanged: (val) {
+              if (val != null) {
+                setState(() {
+                  _selectedPatientEmail = val;
+                });
+              }
+            },
           ),
         );
       },
@@ -91,8 +100,7 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
     );
   }
 
-  Widget _buildWeeklyLogs() {
-    // Week bounds for Firestore query
+  Widget _buildWeeklyLogsStream() {
     String startStr = DateFormat('yyyy-MM-dd').format(_currentWeekStart);
     String endStr = DateFormat('yyyy-MM-dd').format(_currentWeekStart.add(const Duration(days: 7)));
 
@@ -103,10 +111,9 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
           .where('date', isLessThan: endStr)
           .snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.hasError) return _buildEmptyState("Error loading logs. Check internet or permissions.");
+        if (snapshot.hasError) return _buildEmptyState("Error loading logs. Check compound indexes layout.");
         if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
 
-        // Group logs by their date
         Map<String, List<Map<String, dynamic>>> masterMap = {};
         for (var doc in snapshot.data?.docs ?? []) {
           var data = doc.data() as Map<String, dynamic>;
@@ -119,17 +126,16 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
 
         return ListView.builder(
           padding: const EdgeInsets.all(20),
-          itemCount: 7, // Fixed 7 days (Mon-Sun)
+          itemCount: 7, 
           itemBuilder: (context, dayIndex) {
             DateTime currentDay = _currentWeekStart.add(Duration(days: dayIndex));
             String dayStr = DateFormat('yyyy-MM-dd').format(currentDay);
             
             List<Map<String, dynamic>> dayItems = List.from(masterMap[dayStr] ?? []);
 
-            // Sort individual doses by scheduled time
             dayItems.sort((a, b) {
-              String tA = (a['times'] as List).isNotEmpty ? (a['times'] as List).first : "00:00 AM";
-              String tB = (b['times'] as List).isNotEmpty ? (b['times'] as List).first : "00:00 AM";
+              String tA = (a['times'] is List && (a['times'] as List).isNotEmpty) ? (a['times'] as List).first : "00:00 AM";
+              String tB = (b['times'] is List && (b['times'] as List).isNotEmpty) ? (b['times'] as List).first : "00:00 AM";
               return tA.compareTo(tB);
             });
 
@@ -145,12 +151,12 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
                   const Padding(padding: EdgeInsets.only(left: 10, bottom: 10), child: Text("No medication activity logs.", style: TextStyle(color: Colors.grey, fontSize: 11))),
                 
                 ...dayItems.map((item) {
-                  // --- MISSED LOGIC ---
                   String displayStatus = item['adherenceStatus'] ?? "Upcoming";
-                  String sched = (item['times'] as List).isNotEmpty ? (item['times'] as List).first : "--:--";
+                  String sched = (item['times'] is List && (item['times'] as List).isNotEmpty) ? (item['times'] as List).first : "--:--";
                   String actual = item['takenTime'] ?? item['lastTakenTime'] ?? "";
+                  String lifecycleStatus = item['finalStatus'] ?? "Course Active";
 
-                  // If still "Upcoming" but current time > scheduled + 30 mins
+                  // Missed execution tracking window check
                   if (displayStatus.toLowerCase() == "upcoming" && sched != "--:--") {
                     try {
                       DateTime st = DateFormat("hh:mm a").parse(sched);
@@ -159,6 +165,11 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
                         displayStatus = "Missed";
                       }
                     } catch (e) {}
+                  }
+
+                  // Force explicit intercept override status check mapping for archived channels
+                  if (displayStatus.toLowerCase() == "archived" || lifecycleStatus == "Course Terminated") {
+                    displayStatus = "Terminated";
                   }
 
                   return _buildAdherenceCard(item, displayStatus, sched, actual);
@@ -173,7 +184,7 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
   }
 
   Widget _buildAdherenceCard(Map<String, dynamic> item, String displayStatus, String scheduledTime, String actualTime) {
-    String med = item['medName'] ?? item['medDetails'] ?? "Medicine";
+    String med = item['medDetails'] ?? item['medName'] ?? "Medicine";
     int bin = item['slot'] ?? 0;
 
     Color color; IconData icon; String subText;
@@ -190,6 +201,10 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
       case "missed":
         color = Colors.red; icon = Icons.error_outline;
         subText = "Missed: Dose was scheduled for $scheduledTime";
+        break;
+      case "terminated":
+        color = Colors.purple; icon = Icons.cancel_presentation_outlined;
+        subText = "Terminated: Course stopped by Caregiver (Was: $scheduledTime)";
         break;
       default:
         color = Colors.blueGrey; icon = Icons.timer_outlined;
@@ -214,13 +229,21 @@ class _CaregiverAdherenceState extends State<CaregiverAdherence> {
                 ])
               )
             ),
+            // 👇 FIXED: Aligned trailing structural icon segment into an absolute horizontal row line
             Padding(
               padding: const EdgeInsets.only(right: 15), 
-              child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                Icon(icon, color: color, size: 18),
-                const SizedBox(height: 4),
-                Text(displayStatus.toUpperCase(), style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 8)),
-              ])
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Icon(icon, color: color, size: 16),
+                  const SizedBox(width: 6),
+                  Text(
+                    displayStatus.toUpperCase(), 
+                    style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 9, letterSpacing: 0.5)
+                  ),
+                ],
+              ),
             ),
           ],
         ),

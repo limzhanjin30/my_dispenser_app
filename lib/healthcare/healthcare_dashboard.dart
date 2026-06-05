@@ -17,7 +17,8 @@ class HealthcareDashboard extends StatefulWidget {
 class _HealthcareDashboardState extends State<HealthcareDashboard> {
   String fullName = "Healthcare Provider";
   int _totalPatients = 0;
-  int _atRiskPatients = 0;
+  int _missedCount = 0; 
+  int _lateCount = 0; 
   String _avgAdherence = "0%";
   List<Map<String, dynamic>> _clinicalActivityFeed = [];
   bool _isLoading = true;
@@ -28,7 +29,7 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
     _setupClinicalSync();
   }
 
-  // --- LOGIC: PER-DOSE ADHERENCE SYNC ---
+  // --- LOGIC: PER-DOSE SYSTEM RE-SYNC PIPELINE ---
   void _setupClinicalSync() {
     final String clinicalEmail = widget.userEmail.trim().toLowerCase();
     final DateTime now = DateTime.now();
@@ -46,7 +47,7 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
       }
     });
 
-    // 2. Listen to Connections then Adherence Logs
+    // 2. Listen to Connections then fetch Daily Log Collections
     FirebaseFirestore.instance
         .collection('connections')
         .where('healthcareEmail', isEqualTo: clinicalEmail)
@@ -56,25 +57,44 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
       List<String> patientEmails = connectionSnap.docs.map((d) => d.get('patientEmail').toString().toLowerCase().trim()).toList();
       
       if (patientEmails.isEmpty) {
-        if (mounted) setState(() { _isLoading = false; _totalPatients = 0; _clinicalActivityFeed = []; });
+        if (mounted) setState(() { _isLoading = false; _totalPatients = 0; _clinicalActivityFeed = []; _missedCount = 0; _lateCount = 0; _avgAdherence = "0%"; });
         return;
       }
 
-      // Query granular logs for all linked patients for TODAY
+      // --- REVERTED STREAM: MONITOR CHRONOLOGICAL FEED VIA ADHERENCE_LOGS FOR TODAY ---
       FirebaseFirestore.instance
           .collection('adherence_logs')
           .where('patientEmail', whereIn: patientEmails)
           .where('date', isEqualTo: todayStr)
           .snapshots()
-          .listen((logSnap) {
+          .listen((logSnap) async {
         
         int totalScheduled = logSnap.docs.length;
         int totalTaken = 0;
-        Set<String> atRiskEmails = {}; 
+        int totalMissed = 0;
+        int totalLate = 0;
         List<Map<String, dynamic>> feed = [];
 
+        // --- HARDWARE LOOKUP: Pull in-memory hardware slots configurations ---
+        Map<String, List<dynamic>> hardwareStates = {};
+        try {
+          var machineQuery = await FirebaseFirestore.instance
+              .collection('machines')
+              .where('linkedPatientEmail', whereIn: patientEmails)
+              .get();
+
+          for (var mDoc in machineQuery.docs) {
+            String? pEmail = mDoc.data()['linkedPatientEmail'];
+            if (pEmail != null) {
+              hardwareStates[pEmail] = mDoc.data()['slots'] ?? [];
+            }
+          }
+        } catch (e) {
+          debugPrint("Clinical machine state extraction error: $e");
+        }
+
         for (var doc in logSnap.docs) {
-          var data = doc.data() as Map<String, dynamic>;
+          var data = doc.data();
           if (data['finalStatus'] == "Course Terminated") continue;
 
           String status = (data['adherenceStatus'] ?? "Upcoming").toString().toLowerCase().trim();
@@ -83,13 +103,23 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
           String takenT = data['takenTime'] ?? data['lastTakenTime'] ?? "";
           String pName = data['patientName'] ?? "Patient";
           String pEmail = data['patientEmail'] ?? "";
+          int slotNum = data['slot'] ?? 0;
+
+          bool needsRefill = false;
+          if (hardwareStates.containsKey(pEmail)) {
+            var slots = hardwareStates[pEmail]!;
+            var physicalSlot = slots.firstWhere((s) => s['slot'] == slotNum, orElse: () => null);
+            if (physicalSlot != null && physicalSlot['isDone'] == true) {
+              needsRefill = true;
+            }
+          }
 
           Color color;
           IconData icon;
           String msg;
           String sub;
 
-          // --- STATUS CLASSIFICATION (Mirrors Caregiver Logic) ---
+          // --- FEED COMPLIANCE MAP RECLASSIFICATION ---
           if (status == "taken") {
             totalTaken++;
             color = Colors.green;
@@ -98,12 +128,17 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
             sub = "Confirmed on time at $takenT";
           } else if (status == "late") {
             totalTaken++;
+            totalLate++; // Increment the daily late counts explicitly
             color = Colors.orange;
             icon = Icons.priority_high;
             msg = "$pName took $med late";
             sub = "Taken at $takenT (Scheduled: $schedT)";
+          } else if (needsRefill && status == "upcoming") {
+            color = Colors.deepPurple;
+            icon = Icons.inventory_2;
+            msg = "NOT REFILLED: $pName - $med";
+            sub = "Slot $slotNum requires refill for today's intake";
           } else {
-            // Check if Upcoming has timed out (schedule + 30 mins)
             bool isActuallyMissed = false;
             try {
               DateTime st = DateFormat("hh:mm a").parse(schedT);
@@ -114,7 +149,7 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
             } catch (e) {}
 
             if (isActuallyMissed || status == "missed") {
-              atRiskEmails.add(pEmail);
+              totalMissed++; // Increment the daily missed metrics explicitly
               color = Colors.red;
               icon = Icons.error_outline;
               msg = "MISSED: $pName - $med";
@@ -133,17 +168,18 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
             "sub": sub,
             "color": color,
             "icon": icon,
-            "timestamp": (data['timestamp'] as Timestamp?)?.toDate() ?? now,
+            "timeForSort": schedT,
           });
         }
 
-        // Sort feed by most recent activity/schedule
-        feed.sort((a, b) => b['timestamp'].compareTo(a['timestamp']));
+        // Sort activity feed items chronologically by Scheduled Time (Descending)
+        feed.sort((a, b) => b['timeForSort'].compareTo(a['timeForSort']));
 
         if (mounted) {
           setState(() {
             _totalPatients = patientEmails.length;
-            _atRiskPatients = atRiskEmails.length;
+            _missedCount = totalMissed;
+            _lateCount = totalLate;
             _avgAdherence = totalScheduled > 0 ? "${((totalTaken / totalScheduled) * 100).toStringAsFixed(0)}%" : "0%";
             _clinicalActivityFeed = feed;
             _isLoading = false;
@@ -175,26 +211,30 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
         ? const Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70)))
         : RefreshIndicator(
             onRefresh: () async => _setupClinicalSync(),
+            color: const Color(0xFF1A3B70),
             child: SingleChildScrollView(
               physics: const AlwaysScrollableScrollPhysics(),
-              padding: const EdgeInsets.all(25),
+              padding: const EdgeInsets.all(20),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text("Registry Performance", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
                   const SizedBox(height: 20),
 
-                  Row(children: [
-                    Expanded(child: _buildStatCard("Patients", _totalPatients.toString(), Icons.groups, Colors.blue)),
-                    const SizedBox(width: 12),
-                    Expanded(child: _buildStatCard("At-Risk", _atRiskPatients.toString(), Icons.warning_amber_rounded, Colors.red)),
-                    const SizedBox(width: 12),
-                    Expanded(child: _buildStatCard("Daily Adh.", _avgAdherence, Icons.analytics, Colors.green)),
-                  ]),
+                  // 🎯 FIXED STATS SECTION: Formatted grid splitting 4 metrics evenly
+                  Row(
+                    children: [
+                      Expanded(child: _buildStatCard("Patients", _totalPatients.toString(), Icons.groups, Colors.blue)),
+                      const SizedBox(width: 10),
+                      Expanded(child: _buildStatCard("Missed", _missedCount.toString(), Icons.error_outline, Colors.red)),
+                      const SizedBox(width: 10),
+                      Expanded(child: _buildStatCard("Late", _lateCount.toString(), Icons.watch_later_outlined, Colors.orange)),
+                    ],
+                  ),
 
                   const SizedBox(height: 35),
                   const Text("Real-Time Activity Feed", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  const Text("Monitoring per-dose logs across the registry", style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  const Text("Monitoring per-dose log array data within individual devices", style: TextStyle(fontSize: 11, color: Colors.grey)),
                   const SizedBox(height: 15),
 
                   if (_clinicalActivityFeed.isEmpty)
@@ -218,25 +258,39 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
 
   Widget _buildStatCard(String title, String value, IconData icon, Color color) {
     return Container(
-      padding: const EdgeInsets.all(15),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 15),
       decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.grey.shade100)),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(icon, color: color, size: 20),
-        const SizedBox(height: 8),
-        Text(value, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-        Text(title, style: TextStyle(color: Colors.grey[600], fontSize: 9, fontWeight: FontWeight.bold)),
-      ]),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start, 
+        children: [
+          Icon(icon, color: color, size: 20),
+          const SizedBox(height: 8),
+          Text(value, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 2),
+          Text(
+            title, 
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: Colors.grey[600], fontSize: 10, fontWeight: FontWeight.bold)
+          ),
+        ]
+      ),
     );
   }
 
   Widget _buildActivityCard(Map<String, dynamic> act) {
     bool isUrgent = act['color'] == Colors.red;
+    bool isRefill = act['color'] == Colors.deepPurple;
+    
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       elevation: 0,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(12), 
-        side: BorderSide(color: isUrgent ? Colors.red.shade100 : Colors.grey.shade100, width: isUrgent ? 2 : 1)
+        side: BorderSide(
+          color: isUrgent ? Colors.red.shade100 : (isRefill ? Colors.deepPurple.shade100 : Colors.grey.shade100), 
+          width: (isUrgent || isRefill) ? 2 : 1
+        )
       ),
       child: ListTile(
         leading: Container(
@@ -244,7 +298,7 @@ class _HealthcareDashboardState extends State<HealthcareDashboard> {
           decoration: BoxDecoration(color: act['color'].withOpacity(0.1), shape: BoxShape.circle),
           child: Icon(act['icon'], color: act['color'], size: 20),
         ),
-        title: Text(act['msg'], style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: isUrgent ? Colors.red.shade900 : Colors.black)), 
+        title: Text(act['msg'], style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: isUrgent ? Colors.red.shade900 : (isRefill ? Colors.deepPurple.shade900 : Colors.black))), 
         subtitle: Text(act['sub'], style: const TextStyle(fontSize: 11, color: Colors.black54)),
         trailing: const Icon(Icons.chevron_right, size: 16, color: Colors.grey),
         onTap: () => Navigator.push(context, MaterialPageRoute(builder: (context) => HealthcarePrescription(userEmail: widget.userEmail, initialTargetEmail: act['patientEmail']))),

@@ -115,27 +115,25 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     ) ?? false;
   }
 
-  // --- DATABASE: MARK SPECIFIC DOSE LOG AS TAKEN ---
+  // --- HYBRID LOGIC: ATOMIC WRITE BATCH TRANSACTION ON MACHINES & ADHERENCE_LOGS ---
   Future<void> _markAsTaken() async {
     if (_selectedDose == null || linkedMachineId == null) return;
-    
     final doseToLog = _selectedDose!;
     
     // 1. PHYSICAL HARDWARE CHECK: Is the bin actually refilled?
     try {
       DocumentSnapshot machineSnap = await FirebaseFirestore.instance
           .collection('machines')
-          .doc(linkedMachineId)
+          .doc(linkedMachineId!)
           .get();
 
       if (machineSnap.exists) {
-        List<dynamic> slots = List.from(machineSnap.get('slots'));
-        var physicalSlot = slots.firstWhere((s) => s['slot'] == doseToLog['slot']);
+        List<dynamic> slots = List.from(machineSnap.get('slots') ?? []);
+        var physicalSlot = slots.firstWhere((s) => s['slot'] == doseToLog['slot'], orElse: () => null);
 
-        // isDone == true means the bin was emptied previously and hasn't been refilled
-        if (physicalSlot['isDone'] == true) {
+        if (physicalSlot != null && physicalSlot['isDone'] == true) {
           _showErrorSnackBar("Hardware Error: Bin ${doseToLog['slot']} has not been refilled yet!");
-          return; // STOP logic here
+          return; 
         }
       }
     } catch (e) {
@@ -149,13 +147,14 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     setState(() => _isProcessingTaken = true);
     final DateTime now = DateTime.now();
     final String todayStr = DateFormat('yyyy-MM-dd').format(now);
-    final String tomorrowStr = DateFormat('yyyy-MM-dd').format(now.add(const Duration(days: 1)));
     
     bool isLate = now.isAfter(doseToLog['fullTime'].add(const Duration(minutes: 30)));
     String finalStatus = isLate ? "Late" : "Taken";
 
     try {
-      // 3. UPDATE THE LOG FOR TODAY
+      WriteBatch batch = FirebaseFirestore.instance.batch();
+
+      // 3. LOOK UP AND UPDATE DOCUMENT INSIDE THE HISTORICAL ADHERENCE LOGS
       var logQuery = await FirebaseFirestore.instance
           .collection('adherence_logs')
           .where('patientEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
@@ -166,7 +165,7 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
           .get();
 
       if (logQuery.docs.isNotEmpty) {
-        await logQuery.docs.first.reference.update({
+        batch.update(logQuery.docs.first.reference, {
           "adherenceStatus": finalStatus,
           "takenTime": DateFormat('hh:mm a').format(now),
           "lastTakenTime": DateFormat('hh:mm a').format(now),
@@ -175,50 +174,31 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
         });
       }
 
-      // 4. LOOK-AHEAD LOGIC: Check if there is medicine tomorrow
-      var tomorrowLogs = await FirebaseFirestore.instance
-          .collection('adherence_logs')
-          .where('patientEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
-          .where('slot', isEqualTo: doseToLog['slot'])
-          .where('date', isEqualTo: tomorrowStr)
-          .limit(1)
-          .get();
-
-      bool hasDoseTomorrow = tomorrowLogs.docs.isNotEmpty;
-
-      // 5. UPDATE PHYSICAL MACHINE STATE
-      final String machineId = linkedMachineId!;
-      DocumentSnapshot machineDoc = await FirebaseFirestore.instance.collection('machines').doc(machineId).get();
-
+      // 4. FETCH AND UPDATE CURRENT HARDWARE DEVICE ID RECORD SLOTS ARRAY
+      DocumentSnapshot machineDoc = await FirebaseFirestore.instance.collection('machines').doc(linkedMachineId!).get();
       if (machineDoc.exists) {
-        List<dynamic> slots = List.from(machineDoc.get('slots'));
+        List<dynamic> slots = List.from(machineDoc.get('slots') ?? []);
         for (int i = 0; i < slots.length; i++) {
           if (slots[i]['slot'] == doseToLog['slot']) {
-            if (hasDoseTomorrow) {
-              slots[i]['isDone'] = true; 
-              slots[i]['isLocked'] = false; 
-              slots[i]['adherenceStatus'] = finalStatus;
-            } else {
-              slots[i]['status'] = "Empty";
-              slots[i]['isDone'] = false;
-              slots[i]['isLocked'] = false;
-              slots[i]['medDetails'] = "";
-              slots[i]['patientEmail'] = "";
-              slots[i]['times'] = [];
-            }
+            slots[i]['isDone'] = true;
+            slots[i]['isLocked'] = false;
             slots[i]['lastTakenDate'] = todayStr;
             slots[i]['lastTakenTime'] = DateFormat('hh:mm a').format(now);
+            slots[i]['adherenceStatus'] = finalStatus;
             break;
           }
         }
-        await FirebaseFirestore.instance.collection('machines').doc(machineId).update({'slots': slots});
+        batch.update(machineDoc.reference, {'slots': slots});
       }
-      
+
+      // 5. COMMIT ATOMIC OPERATIONS CONCURRENTLY
+      await batch.commit();
+
       setState(() => _selectedDose = null);
       _showSuccessSnackBar("${doseToLog['name']} confirmed!");
-      
     } catch (e) {
-      debugPrint("Update Error: $e");
+      debugPrint("Update Sync Error: $e");
+      _showErrorSnackBar("Sync failed. Check hardware connectivity.");
     } finally {
       if (mounted) setState(() => _isProcessingTaken = false);
     }
@@ -227,7 +207,7 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
   void _showErrorSnackBar(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.redAccent));
   void _showSuccessSnackBar(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.teal));
 
-  // --- DATA FETCHING ---
+  // --- DATA RECOVERY PIPELINE: STREAM FROM PERSISTENT ADHERENCE LOGS FOR TIMELINE VISUALS ---
   Future<void> _fetchUserAndMachineData() async {
     final String cleanEmail = widget.userEmail.trim().toLowerCase();
     if (!mounted) return;
@@ -242,6 +222,8 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
 
         if (linkedMachineId != null) {
           String todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
+          
+          // Keep listening directly to today's active logs collection for UI list syncing
           FirebaseFirestore.instance.collection('adherence_logs')
               .where('patientEmail', isEqualTo: cleanEmail)
               .where('date', isEqualTo: todayStr)

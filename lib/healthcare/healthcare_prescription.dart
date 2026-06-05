@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:cloud_firestore/cloud_firestore.dart'; 
@@ -30,14 +31,26 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
   String? _currentTargetEmail;
   String? _currentTargetName; 
   String? _currentTargetMachineId; 
+  String? _machineOwnerEmail; 
   bool _isLoading = false;
   List<Map<String, dynamic>> _machineSlots = []; 
+  
+  StreamSubscription<DocumentSnapshot>? _machineSubscription;
 
   @override
   void initState() {
     super.initState();
     _currentTargetEmail = widget.initialTargetEmail;
-    if (_currentTargetEmail != null) { _fetchPatientMachineInfo(_currentTargetEmail!); }
+    if (_currentTargetEmail != null) { 
+      _fetchPatientMachineInfo(_currentTargetEmail!); 
+    }
+  }
+
+  @override
+  void dispose() {
+    _machineSubscription?.cancel();
+    _medDetailsController.dispose();
+    super.dispose();
   }
 
   Stream<QuerySnapshot> _getLinkedPatientsStream() {
@@ -47,31 +60,60 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
 
   Future<void> _fetchPatientMachineInfo(String pEmail) async {
     if (!mounted) return;
-    setState(() { _isLoading = true; _currentTargetMachineId = null; });
+    setState(() { 
+      _isLoading = true; 
+      _currentTargetMachineId = null; 
+      _machineOwnerEmail = null;
+      _machineSlots = [];
+      _selectedIndex = 0; 
+    });
+
+    await _machineSubscription?.cancel();
+
     try {
       var userDoc = await FirebaseFirestore.instance.collection('users')
           .where('email', isEqualTo: pEmail.trim().toLowerCase()).limit(1).get();
       if (userDoc.docs.isNotEmpty) {
         var userData = userDoc.docs.first.data();
-        _currentTargetName = userData['name'] ?? "Patient";
+        _currentTargetName = userData['name']; 
         String? machineId = userData['linkedMachineId']; 
         if (machineId != null && machineId.isNotEmpty) {
           _currentTargetMachineId = machineId;
           _listenToMachineStatus();
-        } else { if (mounted) setState(() => _isLoading = false); }
+        } else { 
+          if (mounted) setState(() => _isLoading = false); 
+        }
+      } else {
+        if (mounted) setState(() => _isLoading = false);
       }
-    } catch (e) { if (mounted) setState(() => _isLoading = false); }
+    } catch (e) { 
+      if (mounted) setState(() => _isLoading = false); 
+    }
   }
 
   void _listenToMachineStatus() {
     if (_currentTargetMachineId == null) return;
-    FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).snapshots().listen((snap) {
+    
+    _machineSubscription = FirebaseFirestore.instance
+        .collection('machines')
+        .doc(_currentTargetMachineId!)
+        .snapshots()
+        .listen((snap) {
       if (!mounted) return;
       if (snap.exists) {
+        var machineData = snap.data()!;
+        _machineOwnerEmail = machineData['linkedPatientEmail']?.toString().toLowerCase().trim();
+        List<Map<String, dynamic>> retrievedSlots = List<Map<String, dynamic>>.from(machineData['slots'] ?? []);
+        
         setState(() {
-          _machineSlots = List<Map<String, dynamic>>.from(snap.data()!['slots']);
+          if (retrievedSlots.length > 3) {
+            _machineSlots = retrievedSlots.sublist(0, 3);
+          } else {
+            _machineSlots = retrievedSlots;
+          }
           _isLoading = false; 
         });
+        
         _loadSlotIntoForm(_selectedIndex);
       }
     });
@@ -80,8 +122,27 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
   void _loadSlotIntoForm(int index) {
     if (_machineSlots.isEmpty || index >= _machineSlots.length) return;
     var slot = _machineSlots[index];
-    bool isMine = slot['patientEmail'] == _currentTargetEmail?.trim().toLowerCase();
+    
+    bool isMine = _machineOwnerEmail == _currentTargetEmail?.trim().toLowerCase();
     bool isOccupied = slot['status'] == "Occupied" || slot['status'] == "Completed";
+
+    // --- MIDNIGHT AUTO-EXPIRY TRACKING LOGIC ---
+    if (isOccupied && slot['endDate'] != null && slot['endDate'] != "") {
+      try {
+        DateTime parsedEndDate = DateTime.parse(slot['endDate']);
+        DateTime allowedBoundary = DateTime(parsedEndDate.year, parsedEndDate.month, parsedEndDate.day);
+        
+        DateTime now = DateTime.now();
+        DateTime todayMidnight = DateTime(now.year, now.month, now.day);
+        
+        if (todayMidnight.isAfter(allowedBoundary)) {
+          _clearSlot(index: index);
+          return;
+        }
+      } catch (e) {
+        debugPrint("Auto-expiry computation anomaly: $e");
+      }
+    }
 
     setState(() {
       _selectedIndex = index;
@@ -92,31 +153,31 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
         _startDate = (slot['startDate'] != null && slot['startDate'] != "") ? DateTime.parse(slot['startDate']) : DateTime.now();
         _endDate = (slot['endDate'] != null && slot['endDate'] != "") ? DateTime.parse(slot['endDate']) : DateTime.now().add(const Duration(days: 7));
       } else {
-        _medDetailsController.text = "LOCKED: Occupied by another patient";
+        _medDetailsController.text = "LOCKED: Occupied by another tracking deployment context.";
         _currentMedTimes = [];
       }
     });
   }
 
-  // --- LOGIC: FINISH COURSE (Only archives logs from today onwards) ---
   Future<void> _clearSlot({int? index}) async {
     if (_currentTargetMachineId == null || _currentTargetEmail == null) return;
     int targetIdx = index ?? _selectedIndex;
-    setState(() => _isLoading = true);
+    if (mounted && index == null) setState(() => _isLoading = true);
 
     try {
       final String pEmail = _currentTargetEmail!.trim().toLowerCase();
       final int slotNum = targetIdx + 1;
       final String todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
 
-      var futureLogs = await FirebaseFirestore.instance.collection('adherence_logs')
+      var logsToArchive = await FirebaseFirestore.instance.collection('adherence_logs')
           .where('patientEmail', isEqualTo: pEmail)
           .where('slot', isEqualTo: slotNum)
           .where('date', isGreaterThanOrEqualTo: todayStr)
           .get();
 
       WriteBatch batch = FirebaseFirestore.instance.batch();
-      for (var doc in futureLogs.docs) {
+      
+      for (var doc in logsToArchive.docs) {
         batch.update(doc.reference, {
           "finalStatus": "Course Terminated",
           "status": "Archived",
@@ -124,29 +185,50 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
           "archivedBy": widget.userEmail,
         });
       }
-      await batch.commit();
 
+      if (_machineSlots.length > 3) _machineSlots = _machineSlots.sublist(0, 3);
+      
+      // 👇 FIXED: adherenceStatus parameter flips explicitly to "Archived" context parameters
       _machineSlots[targetIdx] = {
-        "slot": slotNum, "status": "Empty", "patientEmail": "", "patientName": "",
-        "medDetails": "", "times": [], "mealCondition": "After Meal", "frequency": "Everyday",
-        "startDate": "", "endDate": "", "isLocked": false, "isDone": false,
-        "adherenceStatus": "Upcoming", "lastTakenDate": "", "lastTakenTime": "",
+        "slot": slotNum, 
+        "status": "Empty", 
+        "medDetails": "",
+        "times": [], 
+        "mealCondition": "After Meal", 
+        "frequency": "Everyday",
+        "startDate": "", 
+        "endDate": "", 
+        "isLocked": false, 
+        "isDone": false,
+        "adherenceStatus": "Archived", 
+        "lastTakenDate": "", 
+        "lastTakenTime": "",
       };
 
-      await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).update({"slots": _machineSlots});
-      _showMsg("Course stopped. Future logs archived.", Colors.blueGrey);
+      DocumentReference machineRef = FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId!);
+      batch.update(machineRef, {"slots": _machineSlots});
+
+      await batch.commit();
+
+      if (mounted && index == null) _showMsg("Course stopped from today. Prescription records archived.", Colors.blueGrey);
     } catch (e) {
-      _showMsg("Reset Error: $e", Colors.red);
+      if (mounted && index == null) _showMsg("Reset Error: $e", Colors.red);
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted && index == null) setState(() => _isLoading = false);
     }
   }
 
-  // --- LOGIC: SAVE/SYNC (Delete from today onwards and recreate) ---
+  // --- DUAL WRITE SYNC PIPELINE ---
   Future<void> _saveChanges() async {
     if (_currentTargetMachineId == null || _currentTargetEmail == null) return;
     if (_medDetailsController.text.trim().isEmpty || _currentMedTimes.isEmpty) {
       _showMsg("Clinical instructions and timings required.", Colors.orange); return;
+    }
+
+    bool isMine = _machineOwnerEmail == _currentTargetEmail?.trim().toLowerCase();
+    if (_machineOwnerEmail != null && !isMine) {
+      _showMsg("Operation Aborted: Target profile does not match hardware device owner.", Colors.red);
+      return;
     }
 
     setState(() => _isLoading = true);
@@ -157,7 +239,6 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
     final String todayStr = DateFormat('yyyy-MM-dd').format(todayMidnight);
 
     try {
-      // 1. DELETE FUTURE 'UPCOMING' LOGS (Starting from today)
       var logsToDelete = await FirebaseFirestore.instance.collection('adherence_logs')
           .where('patientEmail', isEqualTo: pEmail)
           .where('slot', isEqualTo: slotNum)
@@ -169,13 +250,17 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
         batch.delete(doc.reference);
       }
 
-      // 2. RECREATE NEW LOGS (From today or chosen start date, whichever is later)
       DateTime startPoint = _startDate.isBefore(todayMidnight) ? todayMidnight : _startDate;
-      int totalDays = _endDate.difference(startPoint).inDays + 1;
+      DateTime startMidnight = DateTime(startPoint.year, startPoint.month, startPoint.day);
+      DateTime endMidnight = DateTime(_endDate.year, _endDate.month, _endDate.day);
+      
+      int totalDays = endMidnight.difference(startMidnight).inDays + 1;
 
       if (totalDays > 0) {
         for (int d = 0; d < totalDays; d++) {
-          String logDateStr = DateFormat('yyyy-MM-dd').format(startPoint.add(Duration(days: d)));
+          DateTime logDate = startMidnight.add(Duration(days: d));
+          String logDateStr = DateFormat('yyyy-MM-dd').format(logDate);
+          
           for (String timeSlot in _currentMedTimes) {
             DocumentReference newLogRef = FirebaseFirestore.instance.collection('adherence_logs').doc();
             batch.set(newLogRef, {
@@ -191,7 +276,7 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
               "medDetails": _medDetailsController.text.trim(),
               "patientEmail": pEmail,
               "patientName": _currentTargetName ?? "Patient",
-              "recordType": "Healthcare Re-Sync",
+              "recordType": "Healthcare Setup",
               "slot": slotNum,
               "status": "Occupied",
               "times": [timeSlot], 
@@ -200,23 +285,29 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
           }
         }
       }
-      
-      await batch.commit();
 
-      // 3. Update physical hardware hub
+      if (_machineSlots.length > 3) _machineSlots = _machineSlots.sublist(0, 3);
       _machineSlots[_selectedIndex] = {
-        "slot": slotNum, "status": "Occupied", "patientEmail": pEmail,
-        "patientName": _currentTargetName ?? "Patient",
-        "medDetails": _medDetailsController.text.trim(), "times": _currentMedTimes,
-        "mealCondition": _selectedMealCondition, "frequency": "Everyday",
+        "slot": slotNum, 
+        "status": "Occupied", 
+        "medDetails": _medDetailsController.text.trim(), 
+        "times": _currentMedTimes,
+        "mealCondition": _selectedMealCondition, 
+        "frequency": "Everyday",
         "startDate": DateFormat('yyyy-MM-dd').format(_startDate),
         "endDate": DateFormat('yyyy-MM-dd').format(_endDate),
-        "isLocked": true, "isDone": false,
-        "adherenceStatus": "Upcoming", "lastTakenDate": "", "lastTakenTime": "",
+        "isLocked": true, 
+        "isDone": false,
+        "adherenceStatus": "Upcoming", 
+        "lastTakenDate": "", 
+        "lastTakenTime": "",
       };
 
-      await FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId).update({"slots": _machineSlots});
-      _showMsg("Prescription updated. History preserved.", Colors.teal);
+      DocumentReference machineRef = FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId!);
+      batch.update(machineRef, {"slots": _machineSlots});
+
+      await batch.commit();
+      _showMsg("Prescription updated. Synced cleanly with analytics database.", Colors.teal);
     } catch (e) {
       _showMsg("Sync Error: $e", Colors.red);
     } finally {
@@ -241,7 +332,7 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
       body: StreamBuilder<QuerySnapshot>(
         stream: _getLinkedPatientsStream(),
         builder: (context, snapshot) {
-          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return const Center(child: Text("No linked patients."));
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return const Center(child: Text("No linked patients in clinical registry."));
           var pts = snapshot.data!.docs;
           return _isLoading ? const Center(child: CircularProgressIndicator()) : SingleChildScrollView(
             padding: const EdgeInsets.all(25),
@@ -266,10 +357,12 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
   }
 
   Widget _buildConfigForm() {
-    var slot = _machineSlots[_selectedIndex];
-    bool isMine = slot['patientEmail'] == _currentTargetEmail?.trim().toLowerCase();
-    bool isLockedOther = (slot['status'] == "Occupied" || slot['status'] == "Completed") && !isMine;
+    var slot = _machineSlots.isEmpty || _selectedIndex >= _machineSlots.length ? null : _machineSlots[_selectedIndex];
+    bool isMine = _machineOwnerEmail == _currentTargetEmail?.trim().toLowerCase();
+    bool isLockedOther = slot != null && (slot['status'] == "Occupied" || slot['status'] == "Completed") && !isMine;
     
+    bool isSlotEmpty = slot == null || slot['status'] == "Empty";
+
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       AbsorbPointer(
         absorbing: isLockedOther,
@@ -278,6 +371,27 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             _buildInputField("Medication & Instructions", _medDetailsController, Icons.medical_services_outlined),
             const SizedBox(height: 20),
+            
+            // 👇 FIXED: Added core mealCondition dropdown setup framework
+            const Text("Dietary Intake Requirements", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Color(0xFF1A3B70))),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<String>(
+              value: _selectedMealCondition,
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.restaurant),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                filled: true,
+                fillColor: Colors.white,
+              ),
+              items: ["Before Meal", "After Meal", "With Meal", "Anytime"]
+                  .map((condition) => DropdownMenuItem(value: condition, child: Text(condition)))
+                  .toList(),
+              onChanged: (val) {
+                if (val != null) setState(() => _selectedMealCondition = val);
+              },
+            ),
+            const SizedBox(height: 20),
+
             Row(children: [
               Expanded(child: _buildDateTile("Starts", _startDate, () => _selectDate(context, true))), 
               const SizedBox(width: 12), 
@@ -293,15 +407,20 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
       ),
       const SizedBox(height: 40),
       Row(children: [
-        if (isMine && slot['status'] != "Empty") 
-          Expanded(child: OutlinedButton(onPressed: () => _clearSlot(), style: OutlinedButton.styleFrom(foregroundColor: Colors.red), child: const Text("Finish Course"))),
-        if (isMine && slot['status'] != "Empty") const SizedBox(width: 15),
+        if (isMine && !isSlotEmpty) 
+          Expanded(child: OutlinedButton(onPressed: () => _clearSlot(), style: OutlinedButton.styleFrom(foregroundColor: Colors.red), child: const Text("Reset Slot"))),
+        if (isMine && !isSlotEmpty) const SizedBox(width: 15),
         Expanded(
           flex: 2, 
           child: ElevatedButton(
             onPressed: isLockedOther ? null : _saveChanges, 
             style: ElevatedButton.styleFrom(backgroundColor: isLockedOther ? Colors.grey : const Color(0xFF1A3B70)), 
-            child: Text(isLockedOther ? "BIN UNAVAILABLE" : (isMine ? "Update Prescription" : "Lock Bin ${_selectedIndex + 1}"), style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
+            child: Text(
+              isLockedOther 
+                  ? "BIN UNAVAILABLE" 
+                  : (isSlotEmpty ? "Sync Slot" : "Update Prescription"), 
+              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)
+            )
           )
         ),
       ]),
@@ -309,19 +428,61 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
   }
 
   Widget _buildPatientDropdown(List<DocumentSnapshot> pts) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 15), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.grey.shade300)), 
-    child: DropdownButtonHideUnderline(child: DropdownButton<String>(value: _currentTargetEmail, isExpanded: true, hint: const Text("Select Patient"), items: pts.map((p) => DropdownMenuItem<String>(value: p.get('patientEmail').toString(), child: Text(p.get('patientEmail')))).toList(), onChanged: (v) { if (v != null) { setState(() => _currentTargetEmail = v); _fetchPatientMachineInfo(v); } })),
+    padding: const EdgeInsets.symmetric(horizontal: 15), 
+    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.grey.shade300)), 
+    child: DropdownButtonHideUnderline(
+      child: DropdownButton<String>(
+        value: _currentTargetEmail, 
+        isExpanded: true, 
+        hint: const Text("Select Patient"), 
+        items: pts.map((p) => DropdownMenuItem<String>(value: p.get('patientEmail').toString(), child: Text(p.get('patientEmail')))).toList(), 
+        onChanged: (v) { 
+          if (v != null) { 
+            setState(() => _currentTargetEmail = v); 
+            _fetchPatientMachineInfo(v); 
+          } 
+        }
+      )
+    ),
   );
 
-  Widget _buildSlotGrid() => GridView.builder(shrinkWrap: true, physics: const NeverScrollableScrollPhysics(), gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 5, crossAxisSpacing: 10, mainAxisSpacing: 10), itemCount: 10, itemBuilder: (c, i) { 
-    bool isSelected = _selectedIndex == i; 
-    var sl = _machineSlots.length > i ? _machineSlots[i] : null; 
-    bool isOccupied = sl?['status'] == "Occupied" || sl?['status'] == "Completed";
-    bool isMine = sl?['patientEmail'] == _currentTargetEmail?.trim().toLowerCase();
-    Color color = isMine ? Colors.green.shade100 : (isOccupied ? Colors.red.shade100 : Colors.white);
-    if (isSelected) color = const Color(0xFF1A3B70);
-    return GestureDetector(onTap: () => _loadSlotIntoForm(i), child: Container(decoration: BoxDecoration(color: color, border: Border.all(color: isSelected ? Colors.blue : Colors.grey.shade300), borderRadius: BorderRadius.circular(10)), child: Center(child: Text("${i + 1}", style: TextStyle(fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.black))))); 
-  });
+  Widget _buildSlotGrid() => GridView.builder(
+    shrinkWrap: true, 
+    physics: const NeverScrollableScrollPhysics(), 
+    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+      crossAxisCount: 3, 
+      crossAxisSpacing: 15, 
+      mainAxisSpacing: 15,
+      childAspectRatio: 1.3,
+    ), 
+    itemCount: 3, 
+    itemBuilder: (c, i) { 
+      bool isSelected = _selectedIndex == i; 
+      var sl = _machineSlots.length > i ? _machineSlots[i] : null; 
+      bool isOccupied = sl?['status'] == "Occupied" || sl?['status'] == "Completed";
+      bool isMine = _machineOwnerEmail == _currentTargetEmail?.trim().toLowerCase();
+      
+      Color color = isMine ? Colors.green.shade100 : (isOccupied ? Colors.red.shade100 : Colors.white);
+      if (isSelected) color = const Color(0xFF1A3B70);
+      
+      return GestureDetector(
+        onTap: () => _loadSlotIntoForm(i), 
+        child: Container(
+          decoration: BoxDecoration(
+            color: color, 
+            border: Border.all(color: isSelected ? Colors.blue : Colors.grey.shade300, width: isSelected ? 2.5 : 1), 
+            borderRadius: BorderRadius.circular(12),
+          ), 
+          child: Center(
+            child: Text(
+              "Bin ${i + 1}", 
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: isSelected ? Colors.white : Colors.black87),
+            ),
+          ),
+        ),
+      ); 
+    },
+  );
 
   Widget _buildInputField(String l, TextEditingController c, IconData i) => TextField(controller: c, decoration: InputDecoration(labelText: l, prefixIcon: Icon(i), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), filled: true, fillColor: Colors.white));
   Widget _buildDateTile(String l, DateTime d, VoidCallback t) => InkWell(onTap: t, child: Container(padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10), border: Border.all(color: Colors.grey.shade300)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(l, style: const TextStyle(fontSize: 10, color: Colors.grey)), Text(DateFormat('MMM d').format(d), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))])));

@@ -27,7 +27,7 @@ class _PatientScheduleState extends State<PatientSchedule> {
     _fetchMachineId();
   }
 
-  // --- DATABASE: LOOKUP ---
+  // --- DATABASE: LOOKUP LINKED HARDWARE SERIAL ID ---
   Future<void> _fetchMachineId() async {
     try {
       var userSnap = await FirebaseFirestore.instance
@@ -41,6 +41,8 @@ class _PatientScheduleState extends State<PatientSchedule> {
           _linkedMachineId = userSnap.docs.first.get('linkedMachineId');
           _isInitializing = false;
         });
+      } else {
+        setState(() => _isInitializing = false);
       }
     } catch (e) {
       debugPrint("Error fetching machine ID: $e");
@@ -48,7 +50,7 @@ class _PatientScheduleState extends State<PatientSchedule> {
     }
   }
 
-  // --- LOGIC: DATE VALIDATION ---
+  // --- LOGIC: CHRONOLOGICAL RANGE VALIDATION ---
   bool _isMedActiveOnDate(Map<String, dynamic> med, DateTime date) {
     if (med['startDate'] == null || med['endDate'] == null || med['startDate'] == "") return false;
 
@@ -59,13 +61,11 @@ class _PatientScheduleState extends State<PatientSchedule> {
     DateTime startDate = DateTime(start.year, start.month, start.day);
     DateTime endDate = DateTime(end.year, end.month, end.day);
 
-    // If the course is finished, we still show it on the schedule if the date is within range
     if (checkDate.isBefore(startDate) || checkDate.isAfter(endDate)) return false;
 
     String freq = med['frequency'] ?? "Everyday";
     if (freq == "Everyday") return true;
     
-    // Interval logic if needed for Every X Days
     if (freq.contains("Every") && freq.contains("Days")) {
       try {
         int days = int.parse(freq.split(' ')[1]);
@@ -82,6 +82,9 @@ class _PatientScheduleState extends State<PatientSchedule> {
 
   @override
   Widget build(BuildContext context) {
+    final String cleanUserEmail = widget.userEmail.trim().toLowerCase();
+    final String currentSelectedDateStr = DateFormat('yyyy-MM-dd').format(_selectedDate);
+
     return Scaffold(
       backgroundColor: const Color(0xFFF5F9FF),
       appBar: AppBar(
@@ -102,7 +105,7 @@ class _PatientScheduleState extends State<PatientSchedule> {
           ? const Center(child: CircularProgressIndicator(color: Color(0xFF1A3B70)))
           : Column(
         children: [
-          // --- DATE SELECTOR ---
+          // --- DATE SELECTOR BAR COMPONENT ---
           Container(
             color: Colors.white,
             padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 20),
@@ -121,44 +124,78 @@ class _PatientScheduleState extends State<PatientSchedule> {
             ),
           ),
 
-          // --- REAL-TIME SCHEDULE LIST ---
+          // --- REAL-TIME COMBINED HARDWARE/LOG ENGINE STREAM ---
           Expanded(
             child: _linkedMachineId == null 
               ? _buildEmptyState("Please link your machine in settings.")
               : StreamBuilder<DocumentSnapshot>(
               stream: FirebaseFirestore.instance.collection('machines').doc(_linkedMachineId).snapshots(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
-                if (!snapshot.hasData || !snapshot.data!.exists) return _buildEmptyState("No machine data found.");
+              builder: (context, machineSnapshot) {
+                if (machineSnapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+                if (!machineSnapshot.hasData || !machineSnapshot.data!.exists) return _buildEmptyState("No machine data found.");
                 
-                var data = snapshot.data!.data() as Map<String, dynamic>;
-                List<dynamic> allSlots = data['slots'] ?? [];
+                var machineData = machineSnapshot.data!.data() as Map<String, dynamic>? ?? {};
+                
+                String rootMachineOwner = (machineData['linkedPatientEmail'] ?? "").toString().toLowerCase().trim();
+                if (rootMachineOwner != cleanUserEmail) {
+                  return _buildEmptyState("This hardware array terminal is currently linked to another user.");
+                }
 
-                // FILTER: Include "Occupied" (Active) AND "Finished" (Completed)
-                List<dynamic> myMedsToday = allSlots.where((slot) {
-                  bool belongsToMe = slot['patientEmail'] == widget.userEmail.trim().toLowerCase();
-                  String status = slot['status'] ?? "";
+                List<dynamic> allSlots = machineData['slots'] ?? [];
+
+                // Filter slots active on this selected day
+                List<dynamic> activeSlotsToday = allSlots.where((slot) {
+                  var slotMap = slot as Map<String, dynamic>? ?? {};
+                  String status = slotMap['status'] ?? "";
                   bool isValidStatus = (status == "Occupied" || status == "Finished");
-                  return belongsToMe && isValidStatus && _isMedActiveOnDate(Map<String, dynamic>.from(slot), _selectedDate);
+                  
+                  return isValidStatus && _isMedActiveOnDate(slotMap, _selectedDate);
                 }).toList();
 
-                if (myMedsToday.isEmpty) return _buildEmptyState("No medication scheduled for this date.");
+                if (activeSlotsToday.isEmpty) return _buildEmptyState("No medication scheduled for this date.");
 
-                return ListView.builder(
-                  padding: const EdgeInsets.all(20),
-                  itemCount: myMedsToday.length,
-                  itemBuilder: (context, index) {
-                    final med = myMedsToday[index];
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 15),
-                      child: ScheduleCard(
-                        slotNumber: med['slot'].toString(),
-                        times: List<String>.from(med['times'] ?? []),
-                        medDetails: med['medDetails'] ?? "Medication",
-                        mealCondition: med['mealCondition'] ?? "Anytime",
-                        isDone: med['isDone'] ?? false,
-                        status: med['status'] ?? "Occupied", // Pass status to UI
-                      ),
+                // 👇 Nesting a StreamBuilder directly targeting the specific calendar date logs
+                return StreamBuilder<QuerySnapshot>(
+                  stream: FirebaseFirestore.instance
+                      .collection('adherence_logs')
+                      .where('patientEmail', isEqualTo: cleanUserEmail)
+                      .where('date', isEqualTo: currentSelectedDateStr)
+                      .snapshots(),
+                  builder: (context, logSnapshot) {
+                    if (logSnapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+                    
+                    // Create an easily queryable map map from logs targeting today's date context
+                    Map<int, List<DocumentSnapshot>> dailyLogsBySlot = {};
+                    if (logSnapshot.hasData) {
+                      for (var doc in logSnapshot.data!.docs) {
+                        int slotNum = (doc.get('slot') as num).toInt();
+                        dailyLogsBySlot.putIfAbsent(slotNum, () => []).add(doc);
+                      }
+                    }
+
+                    return ListView.builder(
+                      padding: const EdgeInsets.all(20),
+                      itemCount: activeSlotsToday.length,
+                      itemBuilder: (context, index) {
+                        final med = activeSlotsToday[index];
+                        int slotNum = (med['slot'] as num).toInt();
+                        
+                        // Extract adherence history entries for this specific box allocation mapping
+                        List<DocumentSnapshot> slotLogsToday = dailyLogsBySlot[slotNum] ?? [];
+
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 15),
+                          child: ScheduleCard(
+                            slotNumber: slotNum.toString(),
+                            times: List<String>.from(med['times'] ?? []),
+                            medDetails: med['medDetails'] ?? "Medication",
+                            mealCondition: med['mealCondition'] ?? "Anytime",
+                            status: med['status'] ?? "Occupied", 
+                            selectedDate: _selectedDate, 
+                            dateSpecificLogs: slotLogsToday, 
+                          ),
+                        );
+                      },
                     );
                   },
                 );
@@ -177,7 +214,7 @@ class _PatientScheduleState extends State<PatientSchedule> {
       child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
         Icon(Icons.event_note, size: 60, color: Colors.blue.withOpacity(0.1)),
         const SizedBox(height: 15),
-        Text(msg, textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey, fontSize: 13)),
+        Text(msg, textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey, fontSize: 13, height: 1.4)),
       ]),
     ));
   }
@@ -188,8 +225,9 @@ class ScheduleCard extends StatelessWidget {
   final List<String> times;
   final String medDetails;
   final String mealCondition;
-  final bool isDone;
   final String status;
+  final DateTime selectedDate;
+  final List<DocumentSnapshot> dateSpecificLogs; // Historic sub collection records array
 
   const ScheduleCard({
     super.key, 
@@ -197,21 +235,89 @@ class ScheduleCard extends StatelessWidget {
     required this.times, 
     required this.medDetails, 
     required this.mealCondition, 
-    required this.isDone,
     required this.status,
+    required this.selectedDate,
+    required this.dateSpecificLogs,
   });
+
+  // --- 🎯 HISTORIC LOG TELEMETRY DATA TIME SLOT BADGE EVALUATOR ---
+  Map<String, dynamic> _getTimeSlotStatus(String timeStr) {
+    try {
+      if (status == "Finished") {
+        return {"label": "COMPLETED", "color": Colors.blue, "bgColor": Colors.blue.withOpacity(0.1), "isChecked": true};
+      }
+
+      // Check if there is an explicit log document generated matching this exact time stamp array element
+      DocumentSnapshot? specificTimeLog;
+      for (var log in dateSpecificLogs) {
+        List<dynamic> logTimes = log.get('times') ?? [];
+        if (logTimes.contains(timeStr)) {
+          specificTimeLog = log;
+          break;
+        }
+      }
+
+      // Parse scheduled alarm metrics matching active viewport target values
+      DateTime scheduledTime = DateFormat("yyyy-MM-dd hh:mm a").parse(
+        "${DateFormat('yyyy-MM-dd').format(selectedDate)} $timeStr"
+      );
+      DateTime now = DateTime.now();
+
+      // If a log document is found, determine status from its localized fields
+      if (specificTimeLog != null) {
+        bool logIsDone = specificTimeLog.get('isDone') == true;
+        String logAdherenceStatus = specificTimeLog.get('adherenceStatus') ?? "Upcoming";
+        String actualTakenTime = specificTimeLog.get('lastTakenTime') ?? "";
+
+        if (logIsDone || logAdherenceStatus == "Taken") {
+          if (actualTakenTime.isNotEmpty) {
+            try {
+              DateTime actualTakenDateTime = DateFormat("yyyy-MM-dd hh:mm a").parse(
+                "${DateFormat('yyyy-MM-dd').format(selectedDate)} $actualTakenTime"
+              );
+              if (actualTakenDateTime.isAfter(scheduledTime.add(const Duration(minutes: 30)))) {
+                return {"label": "LATE INTAKE", "color": Colors.purple, "bgColor": Colors.purple.withOpacity(0.1), "isChecked": true};
+              }
+            } catch (_) {}
+          }
+          return {"label": "TAKEN", "color": Colors.green, "bgColor": Colors.green.withOpacity(0.1), "isChecked": true};
+        }
+        
+        if (logAdherenceStatus == "Missed") {
+          return {"label": "MISSED", "color": Colors.red, "bgColor": Colors.red.withOpacity(0.1), "isChecked": false};
+        }
+      }
+
+      // Fallback manual delta evaluation bounds if an individual explicit log reference tree is missing
+      if (now.isAfter(scheduledTime.add(const Duration(hours: 1)))) {
+        return {"label": "MISSED", "color": Colors.red, "bgColor": Colors.red.withOpacity(0.1), "isChecked": false};
+      } else if (now.isAfter(scheduledTime)) {
+        return {"label": "DUE NOW", "color": Colors.orange, "bgColor": Colors.orange.withOpacity(0.1), "isChecked": false};
+      } else {
+        return {"label": "UPCOMING", "color": Colors.grey.shade600, "bgColor": Colors.grey.withOpacity(0.1), "isChecked": false};
+      }
+    } catch (e) {
+      return {"label": "PENDING", "color": Colors.grey, "bgColor": Colors.grey.withOpacity(0.1), "isChecked": false};
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     bool isFinished = status == "Finished";
 
+    // Deduce card-level checkbox verification status dynamically from active logs checklist balances
+    bool isEntireCardChecked = isFinished;
+    if (!isFinished && times.isNotEmpty) {
+      isEntireCardChecked = times.every((t) => _getTimeSlotStatus(t)['isChecked'] == true);
+    }
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: isFinished ? const Color(0xFFF0F7FF) : Colors.white, // Light blue tint for finished
+        color: isFinished ? const Color(0xFFF0F7FF) : Colors.white, 
         borderRadius: BorderRadius.circular(15), 
         border: isFinished ? Border.all(color: Colors.blue.shade100) : null,
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)]
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 10, offset: const Offset(0, 4))]
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -231,8 +337,8 @@ class ScheduleCard extends StatelessWidget {
                 ),
               ),
               Icon(
-                isDone || isFinished ? Icons.check_circle : Icons.radio_button_unchecked, 
-                color: isDone || isFinished ? Colors.green : Colors.grey.shade300
+                isEntireCardChecked ? Icons.check_circle : Icons.radio_button_unchecked, 
+                color: isEntireCardChecked ? Colors.green : Colors.grey.shade300
               ),
             ],
           ),
@@ -243,26 +349,53 @@ class ScheduleCard extends StatelessWidget {
               fontSize: 18, 
               fontWeight: FontWeight.bold, 
               color: isFinished ? Colors.blueGrey : const Color(0xFF1A3B70),
-              decoration: isFinished ? TextDecoration.none : null,
             )
           ),
           const SizedBox(height: 5),
           Text(mealCondition, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: isFinished ? Colors.grey : Colors.orange[800])),
           const Divider(height: 30),
-          const Text("SCHEDULED TIMES:", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
-          const SizedBox(height: 10),
+          const Text("SCHEDULED TIMES & REAL-TIME STATUS:", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
+          const SizedBox(height: 12),
+          
+          // --- REAL-TIME TELEMETRY TRACKING CHIPS PANEL ---
           Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: times.map((t) => Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: isFinished ? Colors.white : const Color(0xFFF5F9FF), 
-                borderRadius: BorderRadius.circular(10), 
-                border: Border.all(color: isFinished ? Colors.blue.shade50 : Colors.blue.withOpacity(0.2))
-              ),
-              child: Text(t, style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isFinished ? Colors.blueGrey : const Color(0xFF1A3B70))),
-            )).toList(),
+            spacing: 10,
+            runSpacing: 10,
+            children: times.map((t) {
+              final statusData = _getTimeSlotStatus(t);
+              
+              return Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF8FAFC),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.grey.shade100)
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.access_time, size: 14, color: const Color(0xFF1A3B70).withOpacity(0.6)),
+                    const SizedBox(width: 6),
+                    Text(
+                      t, 
+                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
+                    ),
+                    const SizedBox(width: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: statusData['bgColor'],
+                        borderRadius: BorderRadius.circular(6)
+                      ),
+                      child: Text(
+                        statusData['label'],
+                        style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: statusData['color']),
+                      ),
+                    )
+                  ],
+                ),
+              );
+            }).toList(),
           )
         ],
       ),

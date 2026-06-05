@@ -17,7 +17,8 @@ class CaregiverDashboard extends StatefulWidget {
 class _CaregiverDashboardState extends State<CaregiverDashboard> {
   String fullName = "Caregiver";
   int _linkedPatientCount = 0;
-  int _actionRequiredCount = 0; 
+  int _missedCount = 0; 
+  int _lateCount = 0; // 👈 Track today's specific late counts separately
   List<Map<String, dynamic>> _machineActivityFeed = [];
   bool _isLoading = true;
 
@@ -54,11 +55,11 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
       List<String> patientEmails = connectionSnap.docs.map((d) => d.get('patientEmail').toString().toLowerCase().trim()).toList();
       
       if (patientEmails.isEmpty) {
-        if (mounted) setState(() { _isLoading = false; _linkedPatientCount = 0; _machineActivityFeed = []; });
+        if (mounted) setState(() { _isLoading = false; _linkedPatientCount = 0; _machineActivityFeed = []; _missedCount = 0; _lateCount = 0; });
         return;
       }
 
-      // Sync Adherence Logs for all linked patients FOR TODAY
+      // --- REVERTED PIPELINE: STREAM DIRECTLY FROM ADHERENCE_LOGS FOR TODAY ---
       FirebaseFirestore.instance
           .collection('adherence_logs')
           .where('patientEmail', whereIn: patientEmails)
@@ -66,20 +67,26 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           .snapshots()
           .listen((logSnap) async {
             
-        int urgentActions = 0;
+        int totalMissed = 0;
+        int totalLate = 0;
         List<Map<String, dynamic>> activityItems = [];
 
-        // --- HARDWARE LOOKUP: Get bin statuses for all patients ---
+        // --- HARDWARE LOOKUP: Get current slot matrix states for hardware refill detection ---
         Map<String, List<dynamic>> hardwareStates = {};
-        for (String pEmail in patientEmails) {
-          var uSnap = await FirebaseFirestore.instance.collection('users').where('email', isEqualTo: pEmail).limit(1).get();
-          if (uSnap.docs.isNotEmpty) {
-            String? mId = uSnap.docs.first.get('linkedMachineId');
-            if (mId != null) {
-              var mSnap = await FirebaseFirestore.instance.collection('machines').doc(mId).get();
-              if (mSnap.exists) hardwareStates[pEmail] = mSnap.get('slots') ?? [];
+        try {
+          var machineQuery = await FirebaseFirestore.instance
+              .collection('machines')
+              .where('linkedPatientEmail', whereIn: patientEmails)
+              .get();
+
+          for (var mDoc in machineQuery.docs) {
+            String? pEmail = mDoc.data()['linkedPatientEmail'];
+            if (pEmail != null) {
+              hardwareStates[pEmail] = mDoc.data()['slots'] ?? [];
             }
           }
+        } catch (e) {
+          debugPrint("Hardware status fetch exception: $e");
         }
 
         for (var doc in logSnap.docs) {
@@ -94,7 +101,7 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           String pName = data['patientName'] ?? "Patient";
           int slotNum = data['slot'] ?? 0;
 
-          // Check if physical hardware bin for this slot is still "Done" (needs refill)
+          // Cross-reference physical hardware matrix states directly using local map structures
           bool needsRefill = false;
           if (hardwareStates.containsKey(pEmail)) {
             var slots = hardwareStates[pEmail]!;
@@ -109,19 +116,19 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           String msg;
           String sub;
 
-          // --- FEED LOGIC: HANDLE LATE, TAKEN, MISSED, AND REFILL ---
+          // --- FEED LOGIC MAP RECLASSIFICATION ---
           if (status == "taken") {
             itemColor = Colors.green;
             itemIcon = Icons.check_circle;
             msg = "$pName took $med";
             sub = "Confirmed on time at $takenAt";
           } else if (status == "late") {
+            totalLate++; // Increment separate late bounds counter explicitly
             itemColor = Colors.orange;
             itemIcon = Icons.priority_high;
             msg = "$pName took $med late";
             sub = "Taken at $takenAt (Scheduled: $schedTime)";
           } else if (needsRefill && status == "upcoming") {
-            // NEW STATUS: NOT REFILLED
             itemColor = Colors.deepPurple;
             itemIcon = Icons.inventory_2;
             msg = "NOT REFILLED: $pName - $med";
@@ -137,7 +144,7 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
             } catch (e) {}
 
             if (isActuallyMissed || status == "missed") {
-              urgentActions++;
+              totalMissed++;
               itemColor = Colors.red;
               itemIcon = Icons.error_outline;
               msg = "MISSED: $pName - $med";
@@ -160,13 +167,14 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
           });
         }
 
-        // Sort by Scheduled Time
+        // Sort chronologically by Scheduled Time (Descending)
         activityItems.sort((a, b) => b['timeForSort'].compareTo(a['timeForSort']));
 
         if (mounted) {
           setState(() {
             _linkedPatientCount = patientEmails.length;
-            _actionRequiredCount = urgentActions;
+            _missedCount = totalMissed;
+            _lateCount = totalLate;
             _machineActivityFeed = activityItems;
             _isLoading = false;
           });
@@ -207,11 +215,16 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
                   const Text("Today's Oversight", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
                   const SizedBox(height: 20),
 
-                  Row(children: [
-                    Expanded(child: _buildStatCard("Linked Patients", _linkedPatientCount.toString(), Icons.people, Colors.teal)),
-                    const SizedBox(width: 15),
-                    Expanded(child: _buildStatCard("Urgent Missed", _actionRequiredCount.toString(), Icons.notification_important, Colors.red)),
-                  ]),
+                  // 🎯 UPDATED STAT CARDS ROW LAYOUT: Grid splitting 3 columns evenly
+                  Row(
+                    children: [
+                      Expanded(child: _buildStatCard("Linked Patients", _linkedPatientCount.toString(), Icons.people, Colors.teal)),
+                      const SizedBox(width: 10),
+                      Expanded(child: _buildStatCard("Doses Missed", _missedCount.toString(), Icons.error_outline, Colors.red)),
+                      const SizedBox(width: 10),
+                      Expanded(child: _buildStatCard("Doses Late", _lateCount.toString(), Icons.watch_later_outlined, Colors.orange)),
+                    ],
+                  ),
 
                   const SizedBox(height: 35),
                   const Text("Activity Feed", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
@@ -239,14 +252,23 @@ class _CaregiverDashboardState extends State<CaregiverDashboard> {
 
   Widget _buildStatCard(String title, String val, IconData icon, Color color) {
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 18),
       decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(15), border: Border.all(color: Colors.grey.shade100)),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(icon, color: color, size: 24),
-        const SizedBox(height: 10),
-        Text(val, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-        Text(title, style: TextStyle(color: Colors.grey[600], fontSize: 11, fontWeight: FontWeight.w500)),
-      ]),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start, 
+        children: [
+          Icon(icon, color: color, size: 22),
+          const SizedBox(height: 10),
+          Text(val, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 2),
+          Text(
+            title, 
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: Colors.grey[600], fontSize: 10, fontWeight: FontWeight.w600)
+          ),
+        ]
+      ),
     );
   }
 

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
+import 'patient_dashboard.dart';
+import '../custom_bottom_nav.dart';
 
 class PatientOverallSchedule extends StatefulWidget {
   final String userEmail;
@@ -20,7 +22,7 @@ class _PatientOverallScheduleState extends State<PatientOverallSchedule> {
     _fetchMachineId();
   }
 
-  // --- STEP 1: FIND LINKED HARDWARE ---
+  // --- STEP 1: FIND LINKED HARDWARE DISPENSER ---
   Future<void> _fetchMachineId() async {
     try {
       var userSnap = await FirebaseFirestore.instance
@@ -45,6 +47,8 @@ class _PatientOverallScheduleState extends State<PatientOverallSchedule> {
 
   @override
   Widget build(BuildContext context) {
+    final String cleanUserEmail = widget.userEmail.trim().toLowerCase();
+
     return Scaffold(
       backgroundColor: const Color(0xFFF5F9FF),
       appBar: AppBar(
@@ -72,15 +76,21 @@ class _PatientOverallScheduleState extends State<PatientOverallSchedule> {
                       return _buildEmptyState("Machine configuration not found.");
                     }
 
-                    var data = snapshot.data!.data() as Map<String, dynamic>;
+                    var data = snapshot.data!.data() as Map<String, dynamic>? ?? {};
+                    
+                    // 🎯 REVISED CHECKING PART: Validate machine root assignment pointer explicitly 
+                    String rootMachineOwner = (data['linkedPatientEmail'] ?? "").toString().toLowerCase().trim();
+                    if (rootMachineOwner != cleanUserEmail) {
+                      return _buildEmptyState("This hardware array terminal is currently linked to another user.");
+                    }
+
                     List<dynamic> allSlots = data['slots'] ?? [];
 
-                    // --- STEP 2: FILTER BY EMAIL + STATUS (Occupied OR Finished) ---
-                    final String myEmail = widget.userEmail.trim().toLowerCase();
+                    // --- STEP 2: FILTER ACTIVE OR COMPLETED MEDICATIONS ---
                     List<dynamic> myMeds = allSlots.where((slot) {
-                      bool belongsToMe = slot['patientEmail'] == myEmail;
-                      String status = slot['status'] ?? "";
-                      return belongsToMe && (status == "Occupied" || status == "Finished");
+                      var slotMap = slot as Map<String, dynamic>? ?? {};
+                      String status = slotMap['status'] ?? "";
+                      return status == "Occupied" || status == "Finished";
                     }).toList();
 
                     if (myMeds.isEmpty) {
@@ -151,29 +161,8 @@ class _PatientOverallScheduleState extends State<PatientOverallSchedule> {
             const SizedBox(height: 10),
             _infoRow(Icons.repeat, "Frequency", med['frequency'] ?? "Daily", isFinished),
             _infoRow(Icons.date_range, "Course Period", "${med['startDate']} to ${med['endDate']}", isFinished),
-            _infoRow(Icons.access_time, "Alarm Schedule", (med['times'] as List).join(', '), isFinished),
+            _infoRow(Icons.access_time, "Alarm Schedule", (med['times'] as List? ?? []).join(', '), isFinished),
             _infoRow(Icons.restaurant, "Instructions", med['mealCondition'] ?? "After Meal", isFinished),
-            
-            // Physical Lock/Finish Status
-            const SizedBox(height: 15),
-            Row(
-              children: [
-                Icon(
-                  isFinished ? Icons.verified : Icons.lock, 
-                  size: 14, 
-                  color: isFinished ? Colors.blue : (med['isLocked'] == true ? Colors.green : Colors.grey)
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  isFinished ? "Course Finished & Bin Released" : (med['isLocked'] == true ? "Physical Bin Locked" : "Bin Unlocked"),
-                  style: TextStyle(
-                    fontSize: 12, 
-                    fontWeight: FontWeight.bold, 
-                    color: isFinished ? Colors.blue : (med['isLocked'] == true ? Colors.green : Colors.grey)
-                  ),
-                ),
-              ],
-            ),
           ],
         ),
       ),
@@ -188,12 +177,14 @@ class _PatientOverallScheduleState extends State<PatientOverallSchedule> {
         children: [
           Icon(icon, size: 16, color: isFinished ? Colors.blueGrey.withOpacity(0.5) : Colors.grey.shade600),
           const SizedBox(width: 12),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(label, style: TextStyle(fontSize: 10, color: Colors.grey.shade500, fontWeight: FontWeight.bold)),
-              Text(value, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: isFinished ? Colors.blueGrey : Colors.black87)),
-            ],
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: TextStyle(fontSize: 10, color: Colors.grey.shade500, fontWeight: FontWeight.bold)),
+                Text(value, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: isFinished ? Colors.blueGrey : Colors.black87)),
+              ],
+            ),
           ),
         ],
       ),

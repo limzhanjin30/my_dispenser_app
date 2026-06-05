@@ -44,34 +44,6 @@ class _PatientInventoryState extends State<PatientInventory> {
     }
   }
 
-  // --- HARDWARE LOGIC: RE-LOCK BIN AFTER MANUAL REFILL ---
-  Future<void> _handleRefill(int index, List<dynamic> allSlots) async {
-    if (_linkedMachineId == null) return;
-
-    try {
-      // Logic: Mark bin as NOT DONE (meaning it is now full) and engage solenoid lock
-      allSlots[index]['isDone'] = false;   // The "Done/Empty" state is reset
-      allSlots[index]['isLocked'] = true;  // The physical hardware is locked
-      
-      // Update the specific slot in the machines collection
-      await FirebaseFirestore.instance
-          .collection('machines')
-          .doc(_linkedMachineId)
-          .update({'slots': allSlots});
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text("${allSlots[index]['medDetails']} bin refilled and secured."),
-            backgroundColor: Colors.teal,
-          ),
-        );
-      }
-    } catch (e) {
-      debugPrint("Refill update error: $e");
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -89,45 +61,111 @@ class _PatientInventoryState extends State<PatientInventory> {
           : _linkedMachineId == null
               ? _buildEmptyState("Please link your dispenser hub in Settings.")
               : StreamBuilder<DocumentSnapshot>(
-                  stream: FirebaseFirestore.instance.collection('machines').doc(_linkedMachineId).snapshots(),
+                  stream: FirebaseFirestore.instance.collection('machines').doc(_linkedMachineId!).snapshots(),
                   builder: (context, snapshot) {
                     if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+                    if (snapshot.hasError) return _buildEmptyState("Error loading calibration records.");
                     if (!snapshot.hasData || !snapshot.data!.exists) return _buildEmptyState("Hardware data unreachable.");
 
-                    var data = snapshot.data!.data() as Map<String, dynamic>;
+                    var data = snapshot.data!.data() as Map<String, dynamic>? ?? {};
                     List<dynamic> allSlots = List.from(data['slots'] ?? []);
                     final String myEmail = widget.userEmail.trim().toLowerCase();
+
+                    // Fetch real-time telemetry weights processed through Seeed Studio HX711 load cell channel bounds
+                    double currentWeight = 0.0;
+                    if (data['totalWeight'] != null) {
+                      currentWeight = (data['totalWeight'] as num).toDouble();
+                    }
+                    String connectionStatus = data['hardwareCommand'] == "CALIBRATE_REFILL" ? "Recalibrating..." : "Online";
 
                     // Filter: Locate slots assigned to THIS patient
                     List<int> mySlotIndices = [];
                     for (int i = 0; i < allSlots.length; i++) {
-                      if (allSlots[i]['patientEmail'].toString().toLowerCase().trim() == myEmail && allSlots[i]['status'] == "Occupied") {
+                      var slotMap = allSlots[i] as Map<String, dynamic>? ?? {};
+                      if (slotMap['status'] == "Occupied") {
                         mySlotIndices.add(i);
                       }
                     }
 
                     if (mySlotIndices.isEmpty) return _buildEmptyState("You have no active physical bins assigned.");
 
-                    return ListView.builder(
+                    return SingleChildScrollView(
+                      physics: const AlwaysScrollableScrollPhysics(),
                       padding: const EdgeInsets.all(20),
-                      itemCount: mySlotIndices.length,
-                      itemBuilder: (context, index) {
-                        int slotIdx = mySlotIndices[index];
-                        var slot = allSlots[slotIdx];
-                        
-                        // KEY LOGIC: isDone == true means the pill was taken (Bin is Empty)
-                        bool needsRefill = (slot['isDone'] == true);
-
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 20),
-                          child: InventoryCard(
-                            medName: slot['medDetails'] ?? "Medication",
-                            slotNumber: slot['slot'].toString(),
-                            isBinEmpty: needsRefill, // Passing the "needs refill" state
-                            onRefill: () => _handleRefill(slotIdx, allSlots),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          // --- REAL-TIME HX711 LOAD CELL WEIGHT TELEMETRY DISPLAY CARD ---
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(20),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1A3B70),
+                              borderRadius: BorderRadius.circular(16),
+                              boxShadow: [BoxShadow(color: Colors.blue.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, 5))]
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    const Text("DISPENSER SCALE MASS", style: TextStyle(color: Colors.white70, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1)),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(color: Colors.green.withOpacity(0.2), borderRadius: BorderRadius.circular(6)),
+                                      child: Text(connectionStatus, style: const TextStyle(color: Colors.greenAccent, fontSize: 9, fontWeight: FontWeight.bold)),
+                                    )
+                                  ],
+                                ),
+                                const SizedBox(height: 15),
+                                Row(
+                                  crossAxisAlignment: CrossAxisAlignment.baseline,
+                                  textBaseline: TextBaseline.alphabetic,
+                                  children: [
+                                    Text(
+                                      currentWeight.toStringAsFixed(2),
+                                      style: const TextStyle(color: Colors.white, fontSize: 36, fontWeight: FontWeight.bold),
+                                    ),
+                                    const SizedBox(width: 5),
+                                    const Text("grams", style: TextStyle(color: Colors.white70, fontSize: 14)),
+                                  ],
+                                ),
+                                const SizedBox(height: 5),
+                                const Text("Total payload mass currently detected on load cell array", style: TextStyle(color: Colors.white54, fontSize: 10)),
+                              ],
+                            ),
                           ),
-                        );
-                      },
+                          const SizedBox(height: 25),
+                          const Text("My Active Physical Bins", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1A3B70), fontSize: 13)),
+                          const SizedBox(height: 12),
+
+                          ListView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            itemCount: mySlotIndices.length,
+                            itemBuilder: (context, index) {
+                              int slotIdx = mySlotIndices[index];
+                              var slot = allSlots[slotIdx];
+
+                              // Extract single dose weight delta set by the caregiver
+                              double expectedDelta = 0.0;
+                              if (slot['singleDoseWeight'] != null) {
+                                  expectedDelta = (slot['singleDoseWeight'] as num).toDouble();
+                              }
+
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 15),
+                                child: InventoryCard(
+                                  medName: slot['medDetails'] ?? "Medication",
+                                  slotNumber: slot['slot'].toString(),
+                                  singleDoseWeight: expectedDelta, // 👈 Successfully pass it down
+                                ),
+                              );
+                            },
+                          ),
+                        ],
+                      ),
                     );
                   },
                 ),
@@ -155,10 +193,14 @@ class _PatientInventoryState extends State<PatientInventory> {
 class InventoryCard extends StatelessWidget {
   final String medName;
   final String slotNumber;
-  final bool isBinEmpty;
-  final VoidCallback onRefill;
+  final double singleDoseWeight; // 👈 Add back property field
 
-  const InventoryCard({super.key, required this.medName, required this.slotNumber, required this.isBinEmpty, required this.onRefill});
+  const InventoryCard({
+    super.key, 
+    required this.medName, 
+    required this.slotNumber, 
+    required this.singleDoseWeight,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -176,49 +218,40 @@ class InventoryCard extends StatelessWidget {
               Container(
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                  color: isBinEmpty ? Colors.orange.withOpacity(0.1) : Colors.green.withOpacity(0.1),
+                  color: const Color(0xFF1A3B70).withOpacity(0.1),
                   shape: BoxShape.circle,
                 ),
-                child: Icon(isBinEmpty ? Icons.shopping_basket_outlined : Icons.lock_clock_outlined, 
-                    color: isBinEmpty ? Colors.orange : Colors.green, size: 24),
+                child: const Icon(Icons.lock_outline, color: Color(0xFF1A3B70), size: 24),
               ),
               const SizedBox(width: 15),
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Text(medName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFF1A3B70))),
+                  const SizedBox(height: 2),
                   Text("Dispenser Slot: $slotNumber", style: const TextStyle(color: Colors.grey, fontSize: 12)),
                 ]),
               ),
             ],
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 15),
           const Divider(height: 1, thickness: 0.5),
-          const SizedBox(height: 20),
+          const SizedBox(height: 15),
+          
+          // 👇 RESTORED: Read-only visibility box for the dose weight configurations
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text("HARDWARE STATUS", style: TextStyle(color: Colors.grey, fontSize: 10, fontWeight: FontWeight.bold)),
+                  const Text("EXPECTED DOSE PAYLOAD MASS", style: TextStyle(color: Colors.grey, fontSize: 9, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 4),
-                  Text(isBinEmpty ? "AWAITING REFILL" : "LOCKED & SECURED", 
-                      style: TextStyle(fontWeight: FontWeight.bold, color: isBinEmpty ? Colors.orange : Colors.green, fontSize: 12)),
+                  Text(
+                    singleDoseWeight > 0.0 ? "${singleDoseWeight.toStringAsFixed(2)} grams" : "Not Configured", 
+                    style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey, fontSize: 13)
+                  ),
                 ],
               ),
-              // ONLY show the refill button if the bin is empty (isDone == true)
-              if (isBinEmpty)
-                ElevatedButton.icon(
-                  onPressed: onRefill,
-                  icon: const Icon(Icons.refresh, size: 14, color: Colors.white),
-                  label: const Text("Mark as Refilled", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF1A3B70), 
-                    elevation: 0,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                    padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 10)
-                  ),
-                ),
             ],
           ),
         ],
