@@ -21,7 +21,6 @@ class _PatientLinkMachineState extends State<PatientLinkMachine> {
     _checkCurrentLinkStatus();
   }
 
-  // Check if the current user already has a machine linked
   Future<void> _checkCurrentLinkStatus() async {
     if (!mounted) return;
     setState(() => _isProcessing = true);
@@ -92,12 +91,12 @@ class _PatientLinkMachineState extends State<PatientLinkMachine> {
       var machineDoc = await FirebaseFirestore.instance.collection('machines').doc(serial).get();
 
       if (!machineDoc.exists) {
-        // Enforce full layout properties for all 3 slot maps inside the array matrix
+        // 🎯 UPDATED: Added boxOpenTime initialization for tamper and anomaly diagnostics tracking
         List<Map<String, dynamic>> initialSlots = List.generate(3, (index) => {
           "slot": index + 1,
           "status": "Empty",
           "medDetails": "",
-          "times": [],
+          "times": "",
           "startDate": "",
           "endDate": "",
           "frequency": "Everyday",
@@ -107,17 +106,21 @@ class _PatientLinkMachineState extends State<PatientLinkMachine> {
           "adherenceStatus": "Upcoming",
           "lastTakenDate": "",
           "lastTakenTime": "",
+          "singleDoseWeight": 0.0,
+          "boxOpenTime": "",
+          "boxCloseTime": "", // 👈 Telemetry tracking baseline for unauthorized entries
+          "remainingDays": 0, // 👈 Add this field initialized to 0
         });
         
         // Save the complete schema payload straight down to the root level of the doc
         await FirebaseFirestore.instance.collection('machines').doc(serial).set({
           'machineId': serial,
-          'linkedPatientEmail': cleanEmail,       
+          'linkedPatientEmail': cleanEmail,      
           'linkedPatientName': patientFullName,   
           'slots': initialSlots,
           'adherenceHistory': [],                 
           
-          // 👇 REAL-TIME LOAD CELL TRACKING VARS ADDED TO ROOT DOCUMENT DIRECTLY
+          // REAL-TIME LOAD CELL TRACKING VARS ADDED TO ROOT DOCUMENT DIRECTLY
           'totalWeight': 0.0,                     // Real-time mass from HX711 Load Cell
           'hardwareCommand': "Online",            // Handshake directive for ESP32-C3
           'lastRefilledSlot': 0,                  // Evaluates past physical actions

@@ -26,7 +26,10 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
   DateTime _pickerTime = DateTime.now();
   DateTime _startDate = DateTime.now();
   DateTime _endDate = DateTime.now().add(const Duration(days: 7));
-  List<String> _currentMedTimes = [];
+  
+  // 🎯 CHANGED: Replaced List<String> array with a clean single String representation
+  String _currentMedTime = "12:00 PM"; 
+  
   int _selectedIndex = 0; 
   String? _currentTargetEmail;
   String? _currentTargetName; 
@@ -126,7 +129,6 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
     bool isMine = _machineOwnerEmail == _currentTargetEmail?.trim().toLowerCase();
     bool isOccupied = slot['status'] == "Occupied" || slot['status'] == "Completed";
 
-    // --- MIDNIGHT AUTO-EXPIRY TRACKING LOGIC ---
     if (isOccupied && slot['endDate'] != null && slot['endDate'] != "") {
       try {
         DateTime parsedEndDate = DateTime.parse(slot['endDate']);
@@ -149,12 +151,16 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
       if (!isOccupied || isMine) {
         _medDetailsController.text = slot['medDetails'] ?? "";
         _selectedMealCondition = slot['mealCondition'] ?? "After Meal";
-        _currentMedTimes = List<String>.from(slot['times'] ?? []);
+        
+        // 🎯 CHANGED: Read timing as a direct string parameter securely
+        String dbTime = slot['times'] ?? "";
+        _currentMedTime = dbTime.trim().isNotEmpty ? dbTime : "12:00 PM";
+        
         _startDate = (slot['startDate'] != null && slot['startDate'] != "") ? DateTime.parse(slot['startDate']) : DateTime.now();
         _endDate = (slot['endDate'] != null && slot['endDate'] != "") ? DateTime.parse(slot['endDate']) : DateTime.now().add(const Duration(days: 7));
       } else {
         _medDetailsController.text = "LOCKED: Occupied by another tracking deployment context.";
-        _currentMedTimes = [];
+        _currentMedTime = "12:00 PM";
       }
     });
   }
@@ -188,12 +194,11 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
 
       if (_machineSlots.length > 3) _machineSlots = _machineSlots.sublist(0, 3);
       
-      // 👇 FIXED: adherenceStatus parameter flips explicitly to "Archived" context parameters
       _machineSlots[targetIdx] = {
         "slot": slotNum, 
         "status": "Empty", 
         "medDetails": "",
-        "times": [], 
+        "times": "", // 🎯 CHANGED: Clears out tracking down to string format baseline
         "mealCondition": "After Meal", 
         "frequency": "Everyday",
         "startDate": "", 
@@ -203,6 +208,10 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
         "adherenceStatus": "Archived", 
         "lastTakenDate": "", 
         "lastTakenTime": "",
+        "remainingDays": 0,
+        "singleDoseWeight": 0.0,
+        "boxOpenTime": [],
+        "boxCloseTime": [],
       };
 
       DocumentReference machineRef = FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId!);
@@ -221,7 +230,7 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
   // --- DUAL WRITE SYNC PIPELINE ---
   Future<void> _saveChanges() async {
     if (_currentTargetMachineId == null || _currentTargetEmail == null) return;
-    if (_medDetailsController.text.trim().isEmpty || _currentMedTimes.isEmpty) {
+    if (_medDetailsController.text.trim().isEmpty || _currentMedTime.isEmpty) {
       _showMsg("Clinical instructions and timings required.", Colors.orange); return;
     }
 
@@ -261,46 +270,62 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
           DateTime logDate = startMidnight.add(Duration(days: d));
           String logDateStr = DateFormat('yyyy-MM-dd').format(logDate);
           
-          for (String timeSlot in _currentMedTimes) {
-            DocumentReference newLogRef = FirebaseFirestore.instance.collection('adherence_logs').doc();
-            batch.set(newLogRef, {
-              "adherenceStatus": "Upcoming",
-              "archivedBy": widget.userEmail,
-              "date": logDateStr,
-              "finalStatus": "Clinical Course Active",
-              "frequency": "Everyday",
-              "isDone": false,
-              "isLocked": true,
-              "lastTakenTime": "",
-              "mealCondition": _selectedMealCondition,
-              "medDetails": _medDetailsController.text.trim(),
-              "patientEmail": pEmail,
-              "patientName": _currentTargetName ?? "Patient",
-              "recordType": "Healthcare Setup",
-              "slot": slotNum,
-              "status": "Occupied",
-              "times": [timeSlot], 
-              "timestamp": FieldValue.serverTimestamp(),
-            });
-          }
+          DocumentReference newLogRef = FirebaseFirestore.instance.collection('adherence_logs').doc();
+          batch.set(newLogRef, {
+            "adherenceStatus": "Upcoming",
+            "archivedBy": widget.userEmail,
+            "date": logDateStr,
+            "finalStatus": "Clinical Course Active",
+            "frequency": "Everyday",
+            "isDone": false,
+            "isLocked": true,
+            "lastTakenTime": "",
+            "mealCondition": _selectedMealCondition,
+            "medDetails": _medDetailsController.text.trim(),
+            "patientEmail": pEmail,
+            "patientName": _currentTargetName ?? "Patient",
+            "recordType": "Healthcare Setup",
+            "slot": slotNum,
+            "status": "Occupied",
+            
+            // 🎯 CHANGED: Writing adherence log time parameter as pure String element context mapping
+            "times": [_currentMedTime], 
+            
+            "timestamp": FieldValue.serverTimestamp(),
+          });
         }
       }
 
       if (_machineSlots.length > 3) _machineSlots = _machineSlots.sublist(0, 3);
+      
+      var existingSlot = _machineSlots[_selectedIndex];
+      String oldMedName = (existingSlot['medDetails'] ?? "").toString().trim().toLowerCase();
+      String newMedName = _medDetailsController.text.trim().toLowerCase();
+      
+      bool isNewMedication = oldMedName != newMedName;
+
       _machineSlots[_selectedIndex] = {
         "slot": slotNum, 
         "status": "Occupied", 
         "medDetails": _medDetailsController.text.trim(), 
-        "times": _currentMedTimes,
+        
+        // 🎯 CHANGED: Saving 'times' inside machines collection as raw String directly
+        "times": _currentMedTime, 
+        
         "mealCondition": _selectedMealCondition, 
         "frequency": "Everyday",
         "startDate": DateFormat('yyyy-MM-dd').format(_startDate),
         "endDate": DateFormat('yyyy-MM-dd').format(_endDate),
-        "isLocked": true, 
-        "isDone": false,
-        "adherenceStatus": "Upcoming", 
-        "lastTakenDate": "", 
-        "lastTakenTime": "",
+        "isLocked": isNewMedication ? true : (existingSlot['isLocked'] ?? true), 
+        "isDone": isNewMedication ? false : (existingSlot['isDone'] ?? false),
+        "adherenceStatus": isNewMedication ? "Upcoming" : (existingSlot['adherenceStatus'] ?? "Upcoming"), 
+        "lastTakenDate": isNewMedication ? "" : (existingSlot['lastTakenDate'] ?? ""), 
+        "lastTakenTime": isNewMedication ? "" : (existingSlot['lastTakenTime'] ?? ""),
+        
+        "remainingDays": isNewMedication ? 0 : (existingSlot['remainingDays'] ?? 0),
+        "singleDoseWeight": isNewMedication ? 0.0 : (existingSlot['singleDoseWeight'] ?? 0.0),
+        "boxOpenTime": isNewMedication ? [] : (existingSlot['boxOpenTime'] ?? []),
+        "boxCloseTime": isNewMedication ? [] : (existingSlot['boxCloseTime'] ?? []),
       };
 
       DocumentReference machineRef = FirebaseFirestore.instance.collection('machines').doc(_currentTargetMachineId!);
@@ -372,7 +397,6 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
             _buildInputField("Medication & Instructions", _medDetailsController, Icons.medical_services_outlined),
             const SizedBox(height: 20),
             
-            // 👇 FIXED: Added core mealCondition dropdown setup framework
             const Text("Dietary Intake Requirements", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Color(0xFF1A3B70))),
             const SizedBox(height: 8),
             DropdownButtonFormField<String>(
@@ -398,9 +422,22 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
               Expanded(child: _buildDateTile("Ends", _endDate, () => _selectDate(context, false)))
             ]),
             const SizedBox(height: 30),
-            const Text("Alarm Schedule", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Color(0xFF1A3B70))),
+            
+            // 🎯 CHANGED: Clean display highlighting the current target time assignment
+            const Text("Scheduled Dose Delivery Time", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Color(0xFF1A3B70))),
             const SizedBox(height: 8),
-            _buildTimeChips(), 
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.grey.shade300)),
+              child: Row(
+                children: [
+                  const Icon(Icons.alarm, color: Color(0xFF1A3B70), size: 20),
+                  const SizedBox(width: 12),
+                  Text(_currentMedTime, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.black87)),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
             _buildTimePickerSection(),
           ]),
         ),
@@ -487,7 +524,21 @@ class _HealthcarePrescriptionState extends State<HealthcarePrescription> {
   Widget _buildInputField(String l, TextEditingController c, IconData i) => TextField(controller: c, decoration: InputDecoration(labelText: l, prefixIcon: Icon(i), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), filled: true, fillColor: Colors.white));
   Widget _buildDateTile(String l, DateTime d, VoidCallback t) => InkWell(onTap: t, child: Container(padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10), border: Border.all(color: Colors.grey.shade300)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(l, style: const TextStyle(fontSize: 10, color: Colors.grey)), Text(DateFormat('MMM d').format(d), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))])));
   Future<void> _selectDate(BuildContext ctx, bool isS) async { final DateTime? p = await showDatePicker(context: ctx, initialDate: isS ? _startDate : _endDate, firstDate: isS ? DateTime.now().subtract(const Duration(days: 1)) : _startDate, lastDate: DateTime(2030)); if (p != null) setState(() { if (isS) { _startDate = p; if (_endDate.isBefore(_startDate)) _endDate = _startDate; } else { _endDate = p; } }); }
-  Widget _buildTimeChips() => Align(alignment: Alignment.centerLeft, child: Wrap(alignment: WrapAlignment.start, spacing: 8, children: _currentMedTimes.map((t) => Chip(label: Text(t, style: const TextStyle(fontSize: 12)), onDeleted: () => setState(() => _currentMedTimes.remove(t)))).toList()));
-  Widget _buildTimePickerSection() => Row(children: [Expanded(child: SizedBox(height: 100, child: CupertinoDatePicker(mode: CupertinoDatePickerMode.time, onDateTimeChanged: (t) => _pickerTime = t))), IconButton.filled(onPressed: () { String f = DateFormat("hh:mm a").format(_pickerTime); if (!_currentMedTimes.contains(f)) setState(() { _currentMedTimes.add(f); _currentMedTimes.sort(); }); }, icon: const Icon(Icons.add_alarm))]);
+  
+  // 🎯 CHANGED: Simplified picker configuration to directly assign value to _currentMedTime string
+  Widget _buildTimePickerSection() => SizedBox(
+    height: 110,
+    child: CupertinoDatePicker(
+      mode: CupertinoDatePickerMode.time,
+      initialDateTime: DateFormat("hh:mm a").parse(_currentMedTime),
+      onDateTimeChanged: (t) {
+        setState(() {
+          _pickerTime = t;
+          _currentMedTime = DateFormat("hh:mm a").format(t);
+        });
+      },
+    ),
+  );
+  
   Widget _buildMachineHeader() => Container(padding: const EdgeInsets.all(15), decoration: BoxDecoration(color: Colors.blue.withOpacity(0.1), borderRadius: BorderRadius.circular(12)), child: Row(children: [const Icon(Icons.settings_remote, size: 18), const SizedBox(width: 10), Text("Device ID: ${_currentTargetMachineId}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))]));
 }

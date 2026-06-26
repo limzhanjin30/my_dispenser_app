@@ -154,7 +154,7 @@ class _PatientScheduleState extends State<PatientSchedule> {
 
                 if (activeSlotsToday.isEmpty) return _buildEmptyState("No medication scheduled for this date.");
 
-                // 👇 Nesting a StreamBuilder directly targeting the specific calendar date logs
+                // Nesting a StreamBuilder directly targeting the specific calendar date logs
                 return StreamBuilder<QuerySnapshot>(
                   stream: FirebaseFirestore.instance
                       .collection('adherence_logs')
@@ -164,7 +164,7 @@ class _PatientScheduleState extends State<PatientSchedule> {
                   builder: (context, logSnapshot) {
                     if (logSnapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
                     
-                    // Create an easily queryable map map from logs targeting today's date context
+                    // Create an easily queryable map from logs targeting today's date context
                     Map<int, List<DocumentSnapshot>> dailyLogsBySlot = {};
                     if (logSnapshot.hasData) {
                       for (var doc in logSnapshot.data!.docs) {
@@ -183,11 +183,21 @@ class _PatientScheduleState extends State<PatientSchedule> {
                         // Extract adherence history entries for this specific box allocation mapping
                         List<DocumentSnapshot> slotLogsToday = dailyLogsBySlot[slotNum] ?? [];
 
+                        // Migration processing check for time field string format conversion
+                        String singleTimeStr = "00:00 AM";
+                        if (med['times'] != null) {
+                          if (med['times'] is String) {
+                            singleTimeStr = med['times'];
+                          } else if (med['times'] is List && (med['times'] as List).isNotEmpty) {
+                            singleTimeStr = med['times'][0].toString();
+                          }
+                        }
+
                         return Padding(
                           padding: const EdgeInsets.only(bottom: 15),
                           child: ScheduleCard(
                             slotNumber: slotNum.toString(),
-                            times: List<String>.from(med['times'] ?? []),
+                            time: singleTimeStr,
                             medDetails: med['medDetails'] ?? "Medication",
                             mealCondition: med['mealCondition'] ?? "Anytime",
                             status: med['status'] ?? "Occupied", 
@@ -222,17 +232,17 @@ class _PatientScheduleState extends State<PatientSchedule> {
 
 class ScheduleCard extends StatelessWidget {
   final String slotNumber;
-  final List<String> times;
+  final String time;
   final String medDetails;
   final String mealCondition;
   final String status;
   final DateTime selectedDate;
-  final List<DocumentSnapshot> dateSpecificLogs; // Historic sub collection records array
+  final List<DocumentSnapshot> dateSpecificLogs; 
 
   const ScheduleCard({
     super.key, 
     required this.slotNumber, 
-    required this.times, 
+    required this.time, 
     required this.medDetails, 
     required this.mealCondition, 
     required this.status,
@@ -247,11 +257,19 @@ class ScheduleCard extends StatelessWidget {
         return {"label": "COMPLETED", "color": Colors.blue, "bgColor": Colors.blue.withOpacity(0.1), "isChecked": true};
       }
 
-      // Check if there is an explicit log document generated matching this exact time stamp array element
+      // Check if there is an explicit log document generated matching this exact time string
       DocumentSnapshot? specificTimeLog;
       for (var log in dateSpecificLogs) {
-        List<dynamic> logTimes = log.get('times') ?? [];
-        if (logTimes.contains(timeStr)) {
+        String logTime = "00:00 AM";
+        var rawTimesField = log.get('times');
+        
+        if (rawTimesField is String) {
+          logTime = rawTimesField;
+        } else if (rawTimesField is List && rawTimesField.isNotEmpty) {
+          logTime = rawTimesField[0].toString();
+        }
+
+        if (logTime.trim() == timeStr.trim()) {
           specificTimeLog = log;
           break;
         }
@@ -304,12 +322,8 @@ class ScheduleCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     bool isFinished = status == "Finished";
-
-    // Deduce card-level checkbox verification status dynamically from active logs checklist balances
-    bool isEntireCardChecked = isFinished;
-    if (!isFinished && times.isNotEmpty) {
-      isEntireCardChecked = times.every((t) => _getTimeSlotStatus(t)['isChecked'] == true);
-    }
+    final statusData = _getTimeSlotStatus(time);
+    bool isEntireCardChecked = isFinished || statusData['isChecked'] == true;
 
     return Container(
       padding: const EdgeInsets.all(20),
@@ -354,48 +368,40 @@ class ScheduleCard extends StatelessWidget {
           const SizedBox(height: 5),
           Text(mealCondition, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: isFinished ? Colors.grey : Colors.orange[800])),
           const Divider(height: 30),
-          const Text("SCHEDULED TIMES & REAL-TIME STATUS:", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
+          const Text("SCHEDULED TIME & REAL-TIME STATUS:", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
           const SizedBox(height: 12),
           
-          // --- REAL-TIME TELEMETRY TRACKING CHIPS PANEL ---
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: times.map((t) {
-              final statusData = _getTimeSlotStatus(t);
-              
-              return Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFF8FAFC),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.grey.shade100)
+          // --- REAL-TIME TELEMETRY TRACKING CHIP ---
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF8FAFC),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.grey.shade100)
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.access_time, size: 14, color: const Color(0xFF1A3B70).withOpacity(0.6)),
+                const SizedBox(width: 6),
+                Text(
+                  time, 
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.access_time, size: 14, color: const Color(0xFF1A3B70).withOpacity(0.6)),
-                    const SizedBox(width: 6),
-                    Text(
-                      t, 
-                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70)),
-                    ),
-                    const SizedBox(width: 10),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: statusData['bgColor'],
-                        borderRadius: BorderRadius.circular(6)
-                      ),
-                      child: Text(
-                        statusData['label'],
-                        style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: statusData['color']),
-                      ),
-                    )
-                  ],
-                ),
-              );
-            }).toList(),
+                const SizedBox(width: 10),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: statusData['bgColor'],
+                    borderRadius: BorderRadius.circular(6)
+                  ),
+                  child: Text(
+                    statusData['label'],
+                    style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: statusData['color']),
+                  ),
+                )
+              ],
+            ),
           )
         ],
       ),

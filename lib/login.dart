@@ -3,44 +3,32 @@ import 'Sign_up.dart';
 import 'patient/patient_dashboard.dart';
 import 'caregiver/caregiver_dashboard.dart';
 import 'healthcare/healthcare_dashboard.dart';
-import 'main.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-
-void main() {
-  runApp(const SmartDispenserApp());
-}
+import 'package:firebase_messaging/firebase_messaging.dart'; // 👈 Added for push telemetry tokens
 
 class SmartDispenserApp extends StatelessWidget {
   const SmartDispenserApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(debugShowCheckedModeBanner: false, home: LoginPage());
+    return const MaterialApp(debugShowCheckedModeBanner: false, home: LoginPage());
   }
 }
 
-bool _isObscure = true; // This tracks if password is hidden or shown
-
 class LoginPage extends StatefulWidget {
-  const LoginPage({super.key}); // Add this line
+  const LoginPage({super.key});
 
   @override
   _LoginPageState createState() => _LoginPageState();
 }
 
 class _LoginPageState extends State<LoginPage> {
-  // Logic to track which role is tapped
   String selectedRole = "Patient";
   bool _isObscure = true;
 
-  // 1. Controllers to capture text field input
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
-
-  // 2. Demo credentials (you can update these during your sign-up flow)
-  String? registeredEmail;
-  String? registeredPassword;
 
   @override
   Widget build(BuildContext context) {
@@ -99,16 +87,8 @@ class _LoginPageState extends State<LoginPage> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         roleCard("Patient", Icons.person_outline, Colors.blue),
-                        roleCard(
-                          "Caregiver",
-                          Icons.people_outline,
-                          Colors.teal,
-                        ),
-                        roleCard(
-                          "Healthcare\nProvider",
-                          Icons.medical_services_outlined,
-                          Colors.purple,
-                        ),
+                        roleCard("Caregiver", Icons.people_outline, Colors.teal),
+                        roleCard("Healthcare\nProvider", Icons.medical_services_outlined, Colors.purple),
                       ],
                     ),
                   ],
@@ -121,39 +101,30 @@ class _LoginPageState extends State<LoginPage> {
                 controller: _emailController,
                 decoration: InputDecoration(
                   labelText: 'Email',
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                 ),
               ),
               const SizedBox(height: 15),
 
-              // --- PASSWORD FIELD WITH VIEW FUNCTION ---
+              // --- PASSWORD FIELD ---
               TextField(
                 obscureText: _isObscure,
                 controller: _passwordController,
                 decoration: InputDecoration(
                   hintText: "Password",
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                  ),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                   suffixIcon: IconButton(
                     icon: Icon(
                       _isObscure ? Icons.visibility_off : Icons.visibility,
                       color: Colors.grey,
                     ),
-                    onPressed: () {
-                      setState(() {
-                        _isObscure = !_isObscure; // Toggles the eye icon
-                      });
-                    },
+                    onPressed: () => setState(() => _isObscure = !_isObscure),
                   ),
                 ),
               ),
-
               const SizedBox(height: 30),
 
-              // --- UPDATED LOGIN BUTTON ---
+              // --- LOGIN ENGINE WITH LIVE DEVICE TOKEN CAPTURE ---
               SizedBox(
                 width: double.infinity,
                 height: 55,
@@ -163,115 +134,78 @@ class _LoginPageState extends State<LoginPage> {
                     String passwordInput = _passwordController.text;
 
                     if (emailInput.isEmpty || passwordInput.isEmpty) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text("Please enter email and password"),
-                        ),
-                      );
+                      _showSnackbar("Please enter email and password");
                       return;
                     }
 
                     try {
-                      // 1. Authenticate with Firebase Auth
-                      UserCredential userCredential = await FirebaseAuth
-                          .instance
-                          .signInWithEmailAndPassword(
-                            email: emailInput,
-                            password: passwordInput,
-                          );
+                      // 1. Authenticate credentials via Auth core
+                      UserCredential userCredential = await FirebaseAuth.instance
+                          .signInWithEmailAndPassword(email: emailInput, password: passwordInput);
 
-                      // 2. Fetch the user's role from Firestore Database
-                      DocumentSnapshot userDoc = await FirebaseFirestore
-                          .instance
-                          .collection('users')
-                          .doc(userCredential.user!.uid)
-                          .get();
+                      // 2. Extract database profile registry fields
+                      DocumentSnapshot userDoc = await FirebaseFirestore.instance
+                          .collection('users').doc(userCredential.user!.uid).get();
 
                       if (userDoc.exists) {
                         String dbRole = userDoc.get('role');
 
-                        // 3. Verify the role matches what they selected on the screen
+                        // 3. Verify security matching alignment parameters
                         if (dbRole == selectedRole) {
-                          // Navigate based on role
+                          
+                          // 🎯 NEW: Capture live background device token parameters for top banners
+                          try {
+                            String? fcmToken = await FirebaseMessaging.instance.getToken();
+                            if (fcmToken != null) {
+                              await FirebaseFirestore.instance
+                                  .collection('users')
+                                  .doc(userCredential.user!.uid)
+                                  .update({'deviceToken': fcmToken});
+                            }
+                          } catch (tokenError) {
+                            debugPrint("Push notification registration token bypass: $tokenError");
+                          }
+
+                          // 4. Route session parameters to selected dashboard arrays
                           if (selectedRole == "Patient") {
-                            Navigator.pushReplacement(
-                              context,
-                              MaterialPageRoute(
-                                builder: (context) =>
-                                    PatientDashboard(userEmail: emailInput),
-                              ),
-                            );
+                            Navigator.pushReplacement(context, MaterialPageRoute(
+                              builder: (context) => PatientDashboard(userEmail: emailInput),
+                            ));
                           } else if (selectedRole == "Caregiver") {
-                            Navigator.pushReplacement(
-                              context,
-                              MaterialPageRoute(
-                                builder: (context) =>
-                                    CaregiverDashboard(userEmail: emailInput),
-                              ),
-                            );
+                            Navigator.pushReplacement(context, MaterialPageRoute(
+                              builder: (context) => CaregiverDashboard(userEmail: emailInput),
+                            ));
                           } else if (selectedRole == "Healthcare\nProvider") {
-                            Navigator.pushReplacement(
-                              context,
-                              MaterialPageRoute(
-                                builder: (context) =>
-                                    HealthcareDashboard(userEmail: emailInput),
-                              ),
-                            );
+                            Navigator.pushReplacement(context, MaterialPageRoute(
+                              builder: (context) => HealthcareDashboard(userEmail: emailInput),
+                            ));
                           }
                         } else {
-                          // Deny access and sign them back out if they pick the wrong role
                           await FirebaseAuth.instance.signOut();
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                "Access Denied: Account is registered as $dbRole.",
-                              ),
-                            ),
-                          );
+                          _showSnackbar("Access Denied: Account is registered as $dbRole.");
                         }
                       } else {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text("User data not found in database."),
-                          ),
-                        );
+                        _showSnackbar("User data not found in database.");
                       }
-                    } on FirebaseAuthException catch (e) {
-                      // Handle incorrect password or email
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text("Invalid email or password"),
-                          backgroundColor: Colors.red,
-                        ),
-                      );
+                    } on FirebaseAuthException catch (_) {
+                      _showSnackbar("Invalid email or password", color: Colors.red);
                     }
                   },
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.blue.shade700,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: const Text(
-                    "Login",
-                    style: TextStyle(fontSize: 18, color: Colors.white),
-                  ),
+                  child: const Text("Login", style: TextStyle(fontSize: 18, color: Colors.white)),
                 ),
               ),
-
               const SizedBox(height: 20),
 
-              // --- UPDATED CENTERED FOOTER (Removed Biometrics) ---
+              // --- FOOTER LINKS ---
               Column(
                 children: [
                   TextButton(
-                    onPressed: () {
-                      // Optional: Add Forgot Password logic here later
-                    },
-                    child: const Text(
-                      "Forgot Password?",
-                      style: TextStyle(color: Colors.blueGrey),
-                    ),
+                    onPressed: () {},
+                    child: const Text("Forgot Password?", style: TextStyle(color: Colors.blueGrey)),
                   ),
                   const SizedBox(height: 10),
                   Row(
@@ -279,21 +213,8 @@ class _LoginPageState extends State<LoginPage> {
                     children: [
                       const Text("Don't have an account? "),
                       GestureDetector(
-                        onTap: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (context) => const SignUpPage(),
-                            ),
-                          );
-                        },
-                        child: const Text(
-                          "Sign Up",
-                          style: TextStyle(
-                            color: Colors.blue,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
+                        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const SignUpPage())),
+                        child: const Text("Sign Up", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
                       ),
                     ],
                   ),
@@ -306,23 +227,19 @@ class _LoginPageState extends State<LoginPage> {
     );
   }
 
-  // --- HELPER WIDGET FOR ROLE CARDS ---
+  void _showSnackbar(String msg, {Color? color}) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: color));
+  }
+
   Widget roleCard(String title, IconData icon, Color themeColor) {
     bool isSelected = selectedRole == title;
     return GestureDetector(
-      onTap: () {
-        setState(() {
-          selectedRole = title;
-        });
-      },
+      onTap: () => setState(() => selectedRole = title),
       child: Container(
         width: 85,
         height: 100,
         decoration: BoxDecoration(
-          border: Border.all(
-            color: isSelected ? themeColor : Colors.grey.shade300,
-            width: 2,
-          ),
+          border: Border.all(color: isSelected ? themeColor : Colors.grey.shade300, width: 2),
           borderRadius: BorderRadius.circular(15),
           color: isSelected ? themeColor.withOpacity(0.05) : Colors.transparent,
         ),
@@ -334,11 +251,7 @@ class _LoginPageState extends State<LoginPage> {
             Text(
               title,
               textAlign: TextAlign.center,
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-                color: Colors.black87,
-              ),
+              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.black87),
             ),
           ],
         ),

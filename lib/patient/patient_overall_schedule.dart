@@ -78,7 +78,7 @@ class _PatientOverallScheduleState extends State<PatientOverallSchedule> {
 
                     var data = snapshot.data!.data() as Map<String, dynamic>? ?? {};
                     
-                    // 🎯 REVISED CHECKING PART: Validate machine root assignment pointer explicitly 
+                    // Validate machine root assignment pointer explicitly 
                     String rootMachineOwner = (data['linkedPatientEmail'] ?? "").toString().toLowerCase().trim();
                     if (rootMachineOwner != cleanUserEmail) {
                       return _buildEmptyState("This hardware array terminal is currently linked to another user.");
@@ -112,6 +112,16 @@ class _PatientOverallScheduleState extends State<PatientOverallSchedule> {
 
   Widget _buildPrescriptionCard(Map<String, dynamic> med) {
     bool isFinished = med['status'] == "Finished";
+
+    // Structural extraction fallback supporting both string updates and legacy list maps
+    String displayTime = "00:00 AM";
+    if (med['times'] != null) {
+      if (med['times'] is String) {
+        displayTime = med['times'];
+      } else if (med['times'] is List && (med['times'] as List).isNotEmpty) {
+        displayTime = med['times'][0].toString();
+      }
+    }
 
     return Card(
       margin: const EdgeInsets.only(bottom: 15),
@@ -161,7 +171,7 @@ class _PatientOverallScheduleState extends State<PatientOverallSchedule> {
             const SizedBox(height: 10),
             _infoRow(Icons.repeat, "Frequency", med['frequency'] ?? "Daily", isFinished),
             _infoRow(Icons.date_range, "Course Period", "${med['startDate']} to ${med['endDate']}", isFinished),
-            _infoRow(Icons.access_time, "Alarm Schedule", (med['times'] as List? ?? []).join(', '), isFinished),
+            _infoRow(Icons.access_time, "Alarm Schedule", displayTime, isFinished),
             _infoRow(Icons.restaurant, "Instructions", med['mealCondition'] ?? "After Meal", isFinished),
           ],
         ),

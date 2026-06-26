@@ -14,40 +14,24 @@ class PatientDashboard extends StatefulWidget {
   State<PatientDashboard> createState() => _PatientDashboardState();
 }
 
-class _PatientDashboardState extends State<PatientDashboard> with TickerProviderStateMixin {
+class _PatientDashboardState extends State<PatientDashboard> {
   String fullName = "Patient";
   String? linkedMachineId;
   
-  List<Map<String, dynamic>> _availableDoses = [];
+  List<Map<String, dynamic>> _availableFallbackDoses = [];
   Map<String, dynamic>? _selectedDose; 
 
   List<dynamic> todaySchedule = [];
   bool _isLoading = true;
-  bool _isProcessingTaken = false;
-
-  late AnimationController _pulseController;
-  late Animation<double> _scaleAnimation;
+  bool _isProcessingFallback = false;
 
   @override
   void initState() {
     super.initState();
-    _initAnimation();
     _fetchUserAndMachineData();
   }
 
-  void _initAnimation() {
-    _pulseController = AnimationController(vsync: this, duration: const Duration(milliseconds: 1000));
-    _scaleAnimation = Tween<double>(begin: 1.0, end: 1.03).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-    );
-  }
-
-  @override
-  void dispose() {
-    _pulseController.dispose();
-    super.dispose();
-  }
-
+  // --- PLAN B FALLBACK LOGIC: MANUAL CONFIRMATION BYPASS ---
   Future<bool> _promptForDispenserPin() async {
     final TextEditingController pinController = TextEditingController();
     String? errorText;
@@ -63,7 +47,9 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
       if (userSnap.docs.isNotEmpty) {
         correctPin = userSnap.docs.first.data()['dispenserPin'];
       }
-    } catch (e) { debugPrint("PIN Error: $e"); }
+    } catch (e) { 
+      debugPrint("PIN Error: $e"); 
+    }
 
     if (correctPin == null) {
       _showErrorSnackBar("Please set a Dispenser PIN in Settings first.");
@@ -81,7 +67,7 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
             content: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Text("Enter PIN to unlock medication bin.", style: TextStyle(fontSize: 12, color: Colors.grey)),
+                const Text("Enter PIN to override hardware log manually.", style: TextStyle(fontSize: 12, color: Colors.grey)),
                 const SizedBox(height: 25),
                 TextField(
                   controller: pinController,
@@ -103,10 +89,13 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A3B70)),
                 onPressed: () {
-                  if (pinController.text == correctPin) Navigator.pop(context, true);
-                  else setDialogState(() => errorText = "Incorrect PIN");
+                  if (pinController.text == correctPin) {
+                    Navigator.pop(context, true);
+                  } else {
+                    setDialogState(() => errorText = "Incorrect PIN");
+                  }
                 },
-                child: const Text("Unlock Bin", style: TextStyle(color: Colors.white)),
+                child: const Text("Verify", style: TextStyle(color: Colors.white)),
               ),
             ],
           );
@@ -115,36 +104,14 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     ) ?? false;
   }
 
-  // --- HYBRID LOGIC: ATOMIC WRITE BATCH TRANSACTION ON MACHINES & ADHERENCE_LOGS ---
-  Future<void> _markAsTaken() async {
+  Future<void> _markAsTakenManualFallback() async {
     if (_selectedDose == null || linkedMachineId == null) return;
-    final doseToLog = _selectedDose!;
     
-    // 1. PHYSICAL HARDWARE CHECK: Is the bin actually refilled?
-    try {
-      DocumentSnapshot machineSnap = await FirebaseFirestore.instance
-          .collection('machines')
-          .doc(linkedMachineId!)
-          .get();
-
-      if (machineSnap.exists) {
-        List<dynamic> slots = List.from(machineSnap.get('slots') ?? []);
-        var physicalSlot = slots.firstWhere((s) => s['slot'] == doseToLog['slot'], orElse: () => null);
-
-        if (physicalSlot != null && physicalSlot['isDone'] == true) {
-          _showErrorSnackBar("Hardware Error: Bin ${doseToLog['slot']} has not been refilled yet!");
-          return; 
-        }
-      }
-    } catch (e) {
-      debugPrint("Refill Check Error: $e");
-    }
-
-    // 2. Proceed with PIN Verification if refill check passed
     bool isAuthorized = await _promptForDispenserPin();
     if (!isAuthorized) return;
 
-    setState(() => _isProcessingTaken = true);
+    setState(() => _isProcessingFallback = true);
+    final doseToLog = _selectedDose!;
     final DateTime now = DateTime.now();
     final String todayStr = DateFormat('yyyy-MM-dd').format(now);
     
@@ -154,27 +121,27 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     try {
       WriteBatch batch = FirebaseFirestore.instance.batch();
 
-      // 3. LOOK UP AND UPDATE DOCUMENT INSIDE THE HISTORICAL ADHERENCE LOGS
+      // 1. Force state transition inside adherence_logs
       var logQuery = await FirebaseFirestore.instance
           .collection('adherence_logs')
           .where('patientEmail', isEqualTo: widget.userEmail.trim().toLowerCase())
           .where('slot', isEqualTo: doseToLog['slot'])
           .where('date', isEqualTo: todayStr)
-          .where('times', arrayContains: doseToLog['displayTime']) 
+          .where('isDone', isEqualTo: false)
           .limit(1)
           .get();
 
       if (logQuery.docs.isNotEmpty) {
         batch.update(logQuery.docs.first.reference, {
           "adherenceStatus": finalStatus,
-          "takenTime": DateFormat('hh:mm a').format(now),
           "lastTakenTime": DateFormat('hh:mm a').format(now),
+          "lastTakenDate": todayStr,
           "isDone": true,
           "timestamp": FieldValue.serverTimestamp(),
         });
       }
 
-      // 4. FETCH AND UPDATE CURRENT HARDWARE DEVICE ID RECORD SLOTS ARRAY
+      // 2. Synchronize variable parameters up to hardware doc level
       DocumentSnapshot machineDoc = await FirebaseFirestore.instance.collection('machines').doc(linkedMachineId!).get();
       if (machineDoc.exists) {
         List<dynamic> slots = List.from(machineDoc.get('slots') ?? []);
@@ -191,23 +158,20 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
         batch.update(machineDoc.reference, {'slots': slots});
       }
 
-      // 5. COMMIT ATOMIC OPERATIONS CONCURRENTLY
       await batch.commit();
-
       setState(() => _selectedDose = null);
-      _showSuccessSnackBar("${doseToLog['name']} confirmed!");
+      _showSuccessSnackBar("Manual override saved for ${doseToLog['name']}.");
     } catch (e) {
-      debugPrint("Update Sync Error: $e");
-      _showErrorSnackBar("Sync failed. Check hardware connectivity.");
+      _showErrorSnackBar("Fallback override execution failed.");
     } finally {
-      if (mounted) setState(() => _isProcessingTaken = false);
+      if (mounted) setState(() => _isProcessingFallback = false);
     }
   }
 
   void _showErrorSnackBar(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.redAccent));
   void _showSuccessSnackBar(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.teal));
 
-  // --- DATA RECOVERY PIPELINE: STREAM FROM PERSISTENT ADHERENCE LOGS FOR TIMELINE VISUALS ---
+  // --- DATA RECOVERY PIPELINE ---
   Future<void> _fetchUserAndMachineData() async {
     final String cleanEmail = widget.userEmail.trim().toLowerCase();
     if (!mounted) return;
@@ -223,7 +187,6 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
         if (linkedMachineId != null) {
           String todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
           
-          // Keep listening directly to today's active logs collection for UI list syncing
           FirebaseFirestore.instance.collection('adherence_logs')
               .where('patientEmail', isEqualTo: cleanEmail)
               .where('date', isEqualTo: todayStr)
@@ -234,47 +197,62 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
           if (mounted) setState(() => _isLoading = false);
         }
       }
-    } catch (e) { if (mounted) setState(() => _isLoading = false); }
+    } catch (e) { 
+      if (mounted) setState(() => _isLoading = false); 
+    }
   }
 
   void _processGranularLogs(List<QueryDocumentSnapshot> logs) {
     DateTime now = DateTime.now();
     DateTime todayMidnight = DateTime(now.year, now.month, now.day);
     List<Map<String, dynamic>> schedule = [];
-    List<Map<String, dynamic>> availableToTake = [];
+    List<Map<String, dynamic>> fallbackAvailable = [];
 
     for (var doc in logs) {
       var data = doc.data() as Map<String, dynamic>;
       if (data['finalStatus'] == "Course Terminated") continue;
 
-      String timeStr = (data['times'] is List && (data['times'] as List).isNotEmpty) 
-          ? (data['times'] as List).first 
-          : "00:00 AM";
+      // Extract single string with structural fallback safety checks
+      String timeStr = "00:00 AM";
+      if (data['times'] != null) {
+        if (data['times'] is String) {
+          timeStr = data['times'];
+        } else if (data['times'] is List && (data['times'] as List).isNotEmpty) {
+          // Safe fallback case handling leftover arrays during DB migration
+          timeStr = data['times'][0].toString();
+        }
+      }
 
       DateTime fullTime = _parseTimeString(timeStr, todayMidnight);
       String status = data['adherenceStatus'] ?? "Upcoming";
-      bool isDone = (status.toLowerCase() == "taken" || status.toLowerCase() == "late");
+      bool isDone = (status.toLowerCase() == "taken" || status.toLowerCase() == "late" || data['isDone'] == true);
 
       var doseInfo = {
         "name": data['medDetails'] ?? data['medName'] ?? "Medicine", 
-        "fullTime": fullTime, "displayTime": timeStr, "isDone": isDone, 
-        "adherenceStatus": status, "slot": data['slot'],
+        "fullTime": fullTime, 
+        "displayTime": timeStr, 
+        "isDone": isDone, 
+        "adherenceStatus": status, 
+        "slot": data['slot'],
       };
       
       schedule.add(doseInfo);
+
+      // Populate fallback selection if dose is missed/due and within valid timeframe
       if (!isDone && now.isAfter(fullTime.subtract(const Duration(minutes: 30)))) {
-        availableToTake.add(doseInfo);
+        fallbackAvailable.add(doseInfo);
       }
     }
 
     schedule.sort((a, b) => (a['fullTime'] as DateTime).compareTo(b['fullTime'] as DateTime));
-    availableToTake.sort((a, b) => (a['fullTime'] as DateTime).compareTo(b['fullTime'] as DateTime));
+    fallbackAvailable.sort((a, b) => (a['fullTime'] as DateTime).compareTo(b['fullTime'] as DateTime));
     
-    if (availableToTake.isNotEmpty) _pulseController.repeat(reverse: true); 
-    else _pulseController.stop();
-
     if (mounted) {
-      setState(() { todaySchedule = schedule; _availableDoses = availableToTake; _isLoading = false; });
+      setState(() { 
+        todaySchedule = schedule; 
+        _availableFallbackDoses = fallbackAvailable;
+        _isLoading = false; 
+      });
     }
   }
 
@@ -282,13 +260,9 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     try {
       DateTime p = DateFormat("hh:mm a").parse(timeStr);
       return DateTime(ref.year, ref.month, ref.day, p.hour, p.minute);
-    } catch (e) { return ref; }
-  }
-
-  String _getCountdownText(DateTime target) {
-    Duration diff = target.difference(DateTime.now());
-    if (diff.isNegative) return "OVERDUE";
-    return "${diff.inHours}h ${diff.inMinutes % 60}m";
+    } catch (e) { 
+      return ref; 
+    }
   }
 
   @override
@@ -296,7 +270,10 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     return Scaffold(
       backgroundColor: const Color(0xFFF5F9FF),
       appBar: AppBar(
-        leading: IconButton(icon: const Icon(Icons.logout, size: 20), onPressed: () => Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (context) => const LoginPage()), (route) => false)),
+        leading: IconButton(
+          icon: const Icon(Icons.logout, size: 20), 
+          onPressed: () => Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (context) => const LoginPage()), (route) => false)
+        ),
         title: const Text("Patient Dashboard", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
         backgroundColor: Colors.transparent, elevation: 0, centerTitle: true,
       ),
@@ -305,17 +282,21 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
         : RefreshIndicator(
             onRefresh: _fetchUserAndMachineData,
             child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
               padding: const EdgeInsets.symmetric(horizontal: 20),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                _buildHeader(),
-                const SizedBox(height: 25),
-                linkedMachineId == null ? _buildLinkMachinePrompt() : _buildSelectionSection(),
-                const SizedBox(height: 35),
-                const Text("Today's Medication Plan", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
-                const SizedBox(height: 15),
-                _buildScheduleList(),
-                const SizedBox(height: 30),
-              ]),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start, 
+                children: [
+                  _buildHeader(),
+                  const SizedBox(height: 25),
+                  linkedMachineId == null ? _buildLinkMachinePrompt() : _buildFallbackSelectionSection(),
+                  const SizedBox(height: 35),
+                  const Text("Today's Medication Plan", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1A3B70))),
+                  const SizedBox(height: 15),
+                  _buildScheduleList(),
+                  const SizedBox(height: 30),
+                ],
+              ),
             ),
           ),
       bottomNavigationBar: CustomBottomNavBar(currentIndex: 0, role: "Patient", userEmail: widget.userEmail),
@@ -332,42 +313,55 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
     ]);
   }
 
-  Widget _buildSelectionSection() {
-    if (_availableDoses.isEmpty) {
-      return Container(width: double.infinity, padding: const EdgeInsets.all(35), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25)), child: Column(children: [const Icon(Icons.verified, color: Colors.green, size: 45), const SizedBox(height: 15), const Text("All Caught Up!", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), const Text("No doses are currently due.", style: TextStyle(color: Colors.grey, fontSize: 13))]));
+  Widget _buildFallbackSelectionSection() {
+    if (_availableFallbackDoses.isEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(35),
+        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25)),
+        child: const Column(children: [
+          Icon(Icons.verified, color: Colors.green, size: 45),
+          SizedBox(height: 15),
+          Text("All Caught Up!", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          Text(
+            "The automated load cells are keeping track of your weights.", 
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.grey, fontSize: 12),
+          )
+        ]),
+      );
     }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text("Select medication to take now:", style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
-        const SizedBox(height: 12),
+        const Text("Plan B Fallback: Manual Confirmation Override", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.orange)),
+        const SizedBox(height: 10),
         SizedBox(
-          height: 100,
+          height: 90,
           child: ListView.builder(
             scrollDirection: Axis.horizontal,
-            itemCount: _availableDoses.length,
+            itemCount: _availableFallbackDoses.length,
             itemBuilder: (context, index) {
-              final dose = _availableDoses[index];
+              final dose = _availableFallbackDoses[index];
               bool isSelected = _selectedDose != null && _selectedDose!['slot'] == dose['slot'] && _selectedDose!['displayTime'] == dose['displayTime'];
               return GestureDetector(
-                onTap: () => setState(() => _selectedDose = dose),
+                onTap: () => setState(() => _selectedDose = isSelected ? null : dose),
                 child: Container(
                   width: 140,
                   margin: const EdgeInsets.only(right: 12),
                   padding: const EdgeInsets.all(12),
                   decoration: BoxDecoration(
-                    color: isSelected ? const Color(0xFF1A3B70) : Colors.white,
+                    color: isSelected ? Colors.orange.shade800 : Colors.white,
                     borderRadius: BorderRadius.circular(15),
-                    border: Border.all(color: isSelected ? Colors.blueAccent : Colors.grey.shade200, width: 2),
+                    border: Border.all(color: isSelected ? Colors.orange : Colors.grey.shade200, width: 2),
                   ),
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Text(dose['name'], maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.black87)),
-                      const SizedBox(height: 4),
-                      Text("Bin ${dose['slot']}", style: TextStyle(fontSize: 11, color: isSelected ? Colors.white70 : Colors.grey)),
-                      Text(dose['displayTime'], style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.blueGrey)),
+                      Text("Slot ${dose['slot']}", style: TextStyle(fontSize: 11, color: isSelected ? Colors.white70 : Colors.grey)),
+                      Text(dose['displayTime'], style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.orange.shade700)),
                     ],
                   ),
                 ),
@@ -375,43 +369,51 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
             },
           ),
         ),
-        const SizedBox(height: 25),
-        if (_selectedDose != null) _buildActionCard() else _buildInstructionsCard(),
+        if (_selectedDose != null) ...[
+          const SizedBox(height: 15),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(color: Colors.orange.withOpacity(0.05), borderRadius: BorderRadius.circular(15), border: Border.all(color: Colors.orange.withOpacity(0.2))),
+            child: Column(
+              children: [
+                const Text("Sensor out of sync or taken without dispensing?", style: TextStyle(fontSize: 11, color: Colors.grey)),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.check_circle_outline, color: Colors.white, size: 18),
+                    onPressed: _isProcessingFallback ? null : _markAsTakenManualFallback,
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade700, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+                    label: _isProcessingFallback 
+                      ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                      : const Text("MANUALLY CONFIRM TAKEN", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
+                  ),
+                ),
+              ],
+            ),
+          )
+        ],
       ],
     );
   }
 
-  Widget _buildActionCard() {
-    DateTime sched = _selectedDose!['fullTime'];
-    bool overdue = DateTime.now().isAfter(sched.add(const Duration(minutes: 30)));
-    return ScaleTransition(
-      scale: _scaleAnimation,
-      child: Container(
-        width: double.infinity, padding: const EdgeInsets.all(25),
-        decoration: BoxDecoration(color: overdue ? Colors.red.shade50 : const Color(0xFF1A3B70), borderRadius: BorderRadius.circular(25), border: overdue ? Border.all(color: Colors.red.shade200, width: 2) : null),
-        child: Column(children: [
-          Text(overdue ? "OVERDUE" : "DUE NOW", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.white70)),
-          const SizedBox(height: 8),
-          Text(_getCountdownText(sched), style: const TextStyle(fontSize: 42, fontWeight: FontWeight.bold, color: Colors.white)),
-          Text("Ready to take ${_selectedDose!['name']}", style: const TextStyle(color: Colors.white, fontSize: 15)),
-          const SizedBox(height: 25),
-          SizedBox(width: double.infinity, child: ElevatedButton(
-            onPressed: _isProcessingTaken ? null : _markAsTaken, 
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.green, padding: const EdgeInsets.symmetric(vertical: 15), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))), 
-            child: _isProcessingTaken ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text("PRESS TO CONFIRM TAKEN", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
-          )),
-        ]),
-      ),
-    );
-  }
-
-  Widget _buildInstructionsCard() => Container(width: double.infinity, padding: const EdgeInsets.all(30), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25), border: Border.all(color: Colors.grey.shade100)), child: Column(children: [Icon(Icons.touch_app, size: 40, color: Colors.grey[400]), const SizedBox(height: 10), const Text("Select a medicine to confirm intake", style: TextStyle(color: Colors.grey, fontSize: 13, fontWeight: FontWeight.bold))]));
-
   Widget _buildScheduleList() {
+    if (todaySchedule.isEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(30),
+        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
+        child: const Center(child: Text("No medication logs scheduled for today.", style: TextStyle(color: Colors.grey, fontSize: 13))),
+      );
+    }
+
     return Container(
       decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
       child: ListView.separated(
-        shrinkWrap: true, physics: const NeverScrollableScrollPhysics(),
+        shrinkWrap: true, 
+        physics: const NeverScrollableScrollPhysics(),
         itemCount: todaySchedule.length,
         separatorBuilder: (context, index) => Divider(height: 1, color: Colors.grey.shade50),
         itemBuilder: (context, index) {
@@ -427,12 +429,16 @@ class _PatientDashboardState extends State<PatientDashboard> with TickerProvider
             leading: Icon(item['isDone'] ? Icons.check_circle : (statusStr == "MISSED" ? Icons.error : Icons.radio_button_off), color: color),
             title: Text(item['displayTime'], style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
             subtitle: Text(item['name']),
-            trailing: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4), decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(8)), child: Text(statusStr, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 10))),
+            trailing: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4), 
+              decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(8)), 
+              child: Text(statusStr, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 10))
+            ),
           );
         },
       ),
     );
   }
 
-  Widget _buildLinkMachinePrompt() => Container(width: double.infinity, padding: const EdgeInsets.all(30), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25)), child: Column(children: [const Icon(Icons.link_off, color: Colors.orange, size: 50), const SizedBox(height: 15), const Text("No Hub Found", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), ElevatedButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => PatientLinkMachine(userEmail: widget.userEmail))), child: const Text("Link Device"))]));
+  Widget _buildLinkMachinePrompt() => Container(width: double.infinity, padding: const EdgeInsets.all(30), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25)), child: Column(children: [const Icon(Icons.link_off, color: Colors.orange, size: 50), const SizedBox(height: 15), const Text("No Hub Found", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), const SizedBox(height: 15), ElevatedButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => PatientLinkMachine(userEmail: widget.userEmail))), style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A3B70), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))), child: const Text("Link Device", style: TextStyle(color: Colors.white)))],),);
 }
